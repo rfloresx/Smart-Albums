@@ -1,0 +1,256 @@
+"""Persistent navigation bar rendered on all authenticated pages.
+
+Layout:
+    [Icon/Logo] | [Pipeline] | [Jobs] | [Prompts] |    [☁✓]   | [Username ▾]
+
+The cloud icon summarizes provider health (green=all ok, yellow=partial,
+red=all down). Clicking opens a dropdown with per-provider status.
+
+The username dropdown provides access to Provider Settings, Account, and Logout.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from typing import Any
+
+from nicegui import ui
+
+from webgui.auth import get_current_username
+
+logger = logging.getLogger(__name__)
+
+# Protocols to check — skips cachemanager (local, always "up").
+_STATUS_SLOTS = ("image", "llm", "embedding")
+
+# Labels for the status dropdown
+_SLOT_LABELS = {
+    "image": "Image",
+    "llm": "LLM",
+    "embedding": "Embedding",
+}
+
+
+def build_navbar() -> None:
+    """Render the application-wide navigation bar.
+
+    Call this at the top of every authenticated page handler (after
+    ``ui.dark_mode(True)``). It uses ``ui.header()`` which sticks to the
+    top of the viewport across scrolls.
+    """
+    username = get_current_username() or "User"
+
+    with ui.header().classes("items-center justify-between q-px-md"):
+        # Left section: logo + nav links
+        with ui.row().classes("items-center gap-1"):
+            # App icon / logo
+            ui.button(
+                "📷 SmartAlbums",
+                on_click=lambda: ui.navigate.to("/"),
+            ).props("flat color=white no-caps").classes("text-subtitle1")
+
+            ui.separator().props("vertical").classes("q-mx-sm")
+
+            # Primary nav items
+            ui.button(
+                "Pipeline",
+                icon="rocket_launch",
+                on_click=lambda: ui.navigate.to("/jobs/new"),
+            ).props("flat color=white no-caps size=md")
+
+            ui.button(
+                "Jobs",
+                icon="history",
+                on_click=lambda: ui.navigate.to("/jobs"),
+            ).props("flat color=white no-caps size=md")
+
+            ui.button(
+                "Schedules",
+                icon="schedule",
+                on_click=lambda: ui.navigate.to("/schedules"),
+            ).props("flat color=white no-caps size=md")
+
+            ui.button(
+                "Custom Pipelines",
+                icon="account_tree",
+                on_click=lambda: ui.navigate.to("/pipelines"),
+            ).props("flat color=white no-caps size=md")
+
+            ui.button(
+                "Prompts",
+                icon="description",
+                on_click=lambda: ui.navigate.to("/prompts"),
+            ).props("flat color=white no-caps size=md")
+
+        # Right section: status indicator + user menu
+        with ui.row().classes("items-center gap-2"):
+            # --- Provider status indicator ---
+            _build_status_indicator()
+
+            # --- User dropdown ---
+            with ui.button(username, icon="person").props(
+                "flat color=white no-caps size=md"
+            ):
+                with ui.menu():
+                    ui.menu_item(
+                        "Provider Settings",
+                        on_click=lambda: ui.navigate.to("/settings"),
+                    ).props("dense")
+                    ui.menu_item(
+                        "Account",
+                        on_click=lambda: ui.navigate.to("/account"),
+                    ).props("dense")
+                    ui.separator()
+                    ui.menu_item(
+                        "Logout",
+                        on_click=lambda: ui.navigate.to("/logout"),
+                    ).props("dense")
+
+
+def _build_status_indicator() -> None:
+    """Build the cloud status icon with a dropdown menu showing per-provider health.
+
+    The icon starts grey (unknown) and updates asynchronously after the page
+    loads. A periodic timer refreshes every 30 seconds.
+    """
+    # The button that shows the summary icon
+    status_btn = ui.button(icon="cloud_queue").props(
+        "flat round dense size=sm color=grey-5"
+    ).tooltip("Provider status — loading…")
+
+    # The dropdown menu (populated after status fetch)
+    menu = ui.menu().props("anchor='bottom right' self='top right'")
+    status_btn.on("click", lambda: menu.open())
+
+    # Container inside the menu for status items
+    with menu:
+        status_container = ui.column().classes("q-pa-sm gap-1").style("min-width: 200px")
+
+    async def refresh_status() -> None:
+        """Fetch provider health and update the indicator."""
+        results = await _check_all_providers()
+        _update_indicator(status_btn, status_container, results)
+
+    # Initial fetch shortly after page load, then every 30s
+    ui.timer(0.5, refresh_status, once=True)
+    ui.timer(30.0, refresh_status)
+
+
+def _update_indicator(
+    btn: Any,
+    container: Any,
+    results: dict[str, tuple[bool | None, str, str]],
+) -> None:
+    """Update the status button icon/color and dropdown content.
+
+    Args:
+        btn: The status button element.
+        container: The column inside the dropdown menu.
+        results: Dict of slot_name -> (connected, provider_name, message).
+            connected is True/False/None (None = not configured).
+    """
+    # Determine summary state
+    statuses = [v[0] for v in results.values()]
+    configured = [s for s in statuses if s is not None]
+
+    if not configured:
+        icon = "cloud_off"
+        color = "grey-5"
+        tooltip = "No providers configured"
+    elif all(configured):
+        icon = "cloud_done"
+        color = "positive"
+        tooltip = "All providers connected"
+    elif any(configured):
+        icon = "cloud_queue"
+        color = "warning"
+        tooltip = "Some providers unreachable"
+    else:
+        icon = "cloud_off"
+        color = "negative"
+        tooltip = "All providers unreachable"
+
+    btn.props(f"icon={icon} color={color}")
+    btn._props["icon"] = icon
+    btn.tooltip(tooltip)
+    btn.update()
+
+    # Rebuild dropdown content
+    container.clear()
+    with container:
+        ui.label("Provider Status").classes("text-caption text-weight-bold q-mb-xs")
+        for slot_name in _STATUS_SLOTS:
+            connected, provider_name, message = results.get(
+                slot_name, (None, "", "Unknown")
+            )
+            label = _SLOT_LABELS.get(slot_name, slot_name)
+            _render_status_row(label, provider_name, connected, message)
+
+
+def _render_status_row(
+    label: str,
+    provider_name: str,
+    connected: bool | None,
+    message: str,
+) -> None:
+    """Render a single provider status row in the dropdown."""
+    if connected is None:
+        dot_color = "grey"
+        status_text = "Not configured"
+    elif connected:
+        dot_color = "positive"
+        status_text = provider_name or "Connected"
+    else:
+        dot_color = "negative"
+        status_text = message or "Unreachable"
+
+    with ui.row().classes("items-center gap-2 no-wrap"):
+        ui.icon("circle", size="10px", color=dot_color)
+        ui.label(f"{label}:").classes("text-caption text-weight-medium").style(
+            "min-width: 70px"
+        )
+        ui.label(status_text).classes("text-caption text-grey")
+
+
+async def _check_all_providers() -> dict[str, tuple[bool | None, str, str]]:
+    """Check health of all configured provider slots.
+
+    Returns:
+        Dict mapping slot name to (connected, provider_name, message).
+        ``connected`` is None when the slot has no provider selected.
+    """
+    from webgui.services import providers as providers_service
+    from webgui.state import state
+
+    results: dict[str, tuple[bool | None, str, str]] = {}
+
+    for slot_name in _STATUS_SLOTS:
+        prov_cfg = state.config.get_provider(slot_name)
+        if not prov_cfg.selected:
+            results[slot_name] = (None, "", "Not configured")
+            continue
+
+        # Find the matching slot object
+        slot = next(
+            (s for s in providers_service.PROTOCOL_SLOTS if s.name == slot_name),
+            None,
+        )
+        if slot is None:
+            results[slot_name] = (None, "", "Unknown slot")
+            continue
+
+        try:
+            ok, message = await asyncio.wait_for(
+                providers_service.test_connection(
+                    slot, prov_cfg.selected, prov_cfg.params, timeout=10.0
+                ),
+                timeout=12.0,
+            )
+            results[slot_name] = (ok, prov_cfg.selected, message)
+        except asyncio.TimeoutError:
+            results[slot_name] = (False, prov_cfg.selected, "Timed out")
+        except Exception as exc:  # noqa: BLE001
+            results[slot_name] = (False, prov_cfg.selected, str(exc))
+
+    return results

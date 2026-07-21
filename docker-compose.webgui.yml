@@ -1,0 +1,28 @@
+services:
+  smart-albums:
+    build:
+      context: .
+      dockerfile: Dockerfile.webgui
+    container_name: smart-albums-gui
+    restart: unless-stopped
+    ports:
+      - "8080:8000"
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+      - smart-albums-cache:/data/cache
+      - smart-albums-prompts:/data/prompts
+      - smart-albums-db:/data/db
+    environment:
+      - CONFIG_PATH=/config/config.yaml
+      - STORAGE_SECRET=${STORAGE_SECRET:-}
+      # Authentication: set admin credentials for first-time setup
+      # - ADMIN_USERNAME=admin
+      # - ADMIN_PASSWORD=changeme
+    # Optional: connect to the same network as Immich/Ollama
+    # networks:
+    #   - immich_default
+
+volumes:
+  smart-albums-cache:
+  smart-albums-prompts:
+  smart-albums-db:

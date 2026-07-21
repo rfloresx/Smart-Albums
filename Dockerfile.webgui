@@ -1,0 +1,78 @@
+# syntax=docker/dockerfile:1
+#
+# Web GUI container for smart-albums (NiceGUI-based).
+#
+# This is a long-running service that provides a web interface for
+# configuring and running pipelines, managing prompts, and monitoring jobs.
+#
+# Build:
+#   docker build -f Dockerfile.webgui -t smart-albums-webgui:latest .
+#
+# Run:
+#   docker run --rm -p 8000:8000 \
+#     -v ./config.yaml:/config/config.yaml:ro \
+#     -v smart-albums-data:/data \
+#     smart-albums-webgui:latest
+
+# ---------------------------------------------------------------------------
+# Stage 1: build a wheel from the src-layout / hatchling project.
+# ---------------------------------------------------------------------------
+FROM python:3.11-slim AS builder
+
+WORKDIR /build
+
+RUN python -m pip install --no-cache-dir --upgrade pip build
+
+# Copy only what the build backend needs.
+COPY pyproject.toml README.md LICENSE ./
+COPY src ./src
+
+# Produce a wheel under /build/dist.
+RUN python -m build --wheel --outdir /build/dist
+
+# ---------------------------------------------------------------------------
+# Stage 2: runtime image with the package + NiceGUI web interface.
+# ---------------------------------------------------------------------------
+FROM python:3.11-slim AS runtime
+
+WORKDIR /app
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    CONFIG_PATH=/config/config.yaml \
+    HF_HOME=/data/hf_cache
+
+# System dependencies for imagehash/Pillow/faiss
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libglib2.0-0 \
+    libjpeg62-turbo \
+    libpng16-16 \
+    libwebp7 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install CPU-only PyTorch (avoids pulling ~2GB CUDA variant)
+RUN pip install --no-cache-dir \
+    torch --index-url https://download.pytorch.org/whl/cpu
+
+# Install the main package from the wheel with all required extras.
+# torch is already satisfied from above so pip won't re-download it.
+COPY --from=builder /build/dist/*.whl /tmp/
+RUN pip install --no-cache-dir "$(ls /tmp/*.whl)[huggingface,openai,webgui]" \
+    && rm -f /tmp/*.whl
+
+# Copy the webgui package and default prompts
+COPY src/webgui /app/webgui
+COPY prompts /app/prompts
+
+# Create data directories
+RUN mkdir -p /data/cache /data/prompts /data/db /data/hf_cache /config
+
+# Run as non-root user
+RUN useradd --uid 1000 --user-group --no-create-home appuser \
+    && chown -R appuser:appuser /data /config /app
+USER appuser
+
+EXPOSE 8000
+
+CMD ["python", "-m", "webgui"]

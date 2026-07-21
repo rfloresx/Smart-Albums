@@ -1,0 +1,58 @@
+{
+  "log_level": "INFO",
+
+  "image": "immich",
+  "image.immich.base_url": "http://localhost:2283/api",
+  "image.immich.api_key": "your-api-key-here",
+
+  "llm": "ollama",
+  "llm.ollama.base_url": "http://localhost:11434",
+  "llm.ollama.vision_model": "llava:latest",
+  "llm.ollama.embed_model": "mxbai-embed-large",
+
+  "embedding": "huggingface",
+  "embedding.huggingface.model_name": "openai/clip-vit-base-patch32",
+  "embedding.huggingface.device": "auto",
+  "embedding.huggingface.batch_size": 16,
+
+  "cachemanager": "cache",
+  "cachemanager.cache.cache_dir": ".cache",
+
+  "pipeline_settings": {
+    "retrieve": {
+      "year": 2025
+    },
+    "score": {
+      "prompt_file": "prompts/best_of_album_curation_guidelines.md",
+      "concurrency": 4
+    },
+    "min_score": {
+      "threshold": 0.4
+    },
+    "events": {
+      "time_window_minutes": 5.0,
+      "gps_window_meters": 100.0
+    },
+    "duplicate": {
+      "threshold": 0.90
+    },
+    "near_duplicate": {
+      "threshold": 0.95
+    },
+    "scene_cluster": {
+      "threshold": 0.85
+    },
+    "output.branches.curation.balanced": {
+      "min_photos": 300,
+      "max_photos": 500
+    },
+    "output.branches.curation.publish": {
+      "name": "Best of 2025",
+      "dry_run": true
+    },
+    "output.branches.remainder.publish": {
+      "name": "Best of 2025 — Extras",
+      "dry_run": true
+    }
+  }
+}
