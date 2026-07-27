@@ -61,8 +61,9 @@ COPY --from=builder /build/dist/*.whl /tmp/
 RUN pip install --no-cache-dir "$(ls /tmp/*.whl)[huggingface,openai,webgui]" \
     && rm -f /tmp/*.whl
 
-# Copy the webgui package and default prompts
+# Copy the webgui package, scripts, and default prompts
 COPY src/webgui /app/webgui
+COPY scripts /app/scripts
 COPY prompts /app/prompts
 
 # Create data directories

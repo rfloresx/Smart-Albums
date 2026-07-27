@@ -39,7 +39,7 @@ _SCRIPTS: list[dict[str, str]] = [
             "Updates old best-of-year pipeline_settings to use the new composite "
             "node layout (DedupPHashComposite, DedupSimilar, DedupScenes)."
         ),
-        "module": "scripts.migrate_best_of_year_presets",
+        "script": "scripts/migrate_best_of_year_presets.py",
     },
 ]
 
@@ -55,9 +55,11 @@ async def _run_script(script_id: str, log_area: Any) -> None:
     log_area.set_value("")
 
     try:
-        # Run the migration in a subprocess to isolate it from the running app
+        # Run the script file directly to avoid module resolution issues
+        import sys
+        script_path = str(Path(script["script"]).resolve())
         proc = await asyncio.create_subprocess_exec(
-            "python", "-m", script["module"], db_path,
+            sys.executable, script_path, db_path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
