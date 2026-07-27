@@ -34,9 +34,10 @@ def _preview(content: str, max_chars: int = 220) -> str:
 class _PromptEditor:
     """Shared create/edit dialog for a prompt file.
 
-    In create mode the name field is editable; in edit mode the name is
-    fixed (renaming isn't supported — delete and recreate instead) and only
-    the content can change.
+    In create mode the name field is editable and an upload option is
+    available to populate from a .md file; in edit mode the name is fixed
+    (renaming isn't supported — delete and recreate instead) and only the
+    content can change.
     """
 
     def __init__(self, on_saved) -> None:
@@ -45,6 +46,18 @@ class _PromptEditor:
 
         with ui.dialog() as self.dialog, ui.card().classes("w-full max-w-2xl"):
             self.title_label = ui.label("New Prompt").classes("text-h6")
+
+            # Upload option (visible only in create mode)
+            with ui.row().classes("w-full items-center gap-2") as self._upload_row:
+                ui.label("Upload a .md file or write content below:").classes(
+                    "text-caption text-grey"
+                )
+                self._upload_el = ui.upload(
+                    label="Upload .md",
+                    auto_upload=True,
+                    on_upload=self._handle_upload,
+                ).props("accept=.md flat bordered dense").classes("max-w-xs")
+
             self.name_input = ui.input(label="Name").classes("w-full").props(
                 "outlined dense"
             )
@@ -63,6 +76,8 @@ class _PromptEditor:
         self.title_label.text = "New Prompt"
         self.name_input.value = ""
         self.name_input.set_visibility(True)
+        self._upload_row.set_visibility(True)
+        self._upload_el.reset()
         self.content_input.value = ""
         self.error_label.set_visibility(False)
         self.dialog.open()
@@ -72,9 +87,25 @@ class _PromptEditor:
         self.title_label.text = f"Edit — {prompt.label}"
         self.name_input.value = prompt.name
         self.name_input.set_visibility(False)
+        self._upload_row.set_visibility(False)
         self.content_input.value = prompt.content
         self.error_label.set_visibility(False)
         self.dialog.open()
+
+    def _handle_upload(self, e) -> None:
+        """Populate name and content fields from an uploaded .md file."""
+        try:
+            content = e.content.read().decode("utf-8")
+            filename = e.name if hasattr(e, "name") else "uploaded.md"
+            # Pre-fill the name field (user can still edit before saving)
+            if not self.name_input.value:
+                self.name_input.value = filename
+            self.content_input.value = content
+            self.error_label.set_visibility(False)
+            ui.notify(f"Loaded content from {filename}", type="info")
+        except Exception as exc:
+            self.error_label.text = f"Upload failed: {exc}"
+            self.error_label.set_visibility(True)
 
     async def _save(self) -> None:
         content = self.content_input.value or ""

@@ -70,6 +70,7 @@ import webgui.pages.jobs  # noqa: E402, F401
 import webgui.pages.account  # noqa: E402, F401
 import webgui.pages.schedules  # noqa: E402, F401
 import webgui.pages.user_pipelines  # noqa: E402, F401
+import webgui.pages.tools  # noqa: E402, F401
 
 
 # Page routes that do not require authentication.

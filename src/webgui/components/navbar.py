@@ -103,6 +103,11 @@ def build_navbar() -> None:
                     ).props("dense")
                     ui.separator()
                     ui.menu_item(
+                        "Tools",
+                        on_click=lambda: ui.navigate.to("/tools"),
+                    ).props("dense")
+                    ui.separator()
+                    ui.menu_item(
                         "Logout",
                         on_click=lambda: ui.navigate.to("/logout"),
                     ).props("dense")

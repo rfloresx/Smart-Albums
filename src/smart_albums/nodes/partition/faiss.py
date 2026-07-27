@@ -30,14 +30,6 @@ class PartitionFaiss(Stage):
             default=0.95,
             description="Minimum cosine similarity to group assets as near-duplicates.",
         ),
-        ConfigParam(
-            key="mode",
-            type=str,
-            default="global",
-            choices=["global", "per_partition"],
-            description="Grouping mode: 'global' groups all assets together, "
-            "'per_partition' groups within existing partition contexts.",
-        ),
     )
 
     async def run(self, ctx: PipelineContext) -> ContextBatch:
