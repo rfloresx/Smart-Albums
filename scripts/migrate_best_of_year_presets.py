@@ -108,6 +108,13 @@ def migrate_settings(settings: dict[str, Any]) -> dict[str, Any]:
     return result if changed else settings
 
 
+def has_updated_at(conn: sqlite3.Connection, table: str) -> bool:
+    """Check if a table has an updated_at column."""
+    cursor = conn.execute(f"PRAGMA table_info({table})")
+    columns = {row["name"] for row in cursor.fetchall()}
+    return "updated_at" in columns
+
+
 def migrate_database(db_path: str, *, dry_run: bool = False) -> None:
     """Run the migration against the SQLite database.
 
@@ -163,11 +170,18 @@ def migrate_database(db_path: str, *, dry_run: bool = False) -> None:
                 print(f"    New: {json.dumps(new_settings, indent=2)}")
                 print()
             else:
-                now = datetime.now(timezone.utc).isoformat()
-                conn.execute(
-                    f"UPDATE {table} SET pipeline_settings = ?, updated_at = ? WHERE {pk_col} = ?",
-                    (json.dumps(new_settings), now, row_id),
-                )
+                new_json = json.dumps(new_settings)
+                if has_updated_at(conn, table):
+                    now = datetime.now(timezone.utc).isoformat()
+                    conn.execute(
+                        f"UPDATE {table} SET pipeline_settings = ?, updated_at = ? WHERE {pk_col} = ?",
+                        (new_json, now, row_id),
+                    )
+                else:
+                    conn.execute(
+                        f"UPDATE {table} SET pipeline_settings = ? WHERE {pk_col} = ?",
+                        (new_json, row_id),
+                    )
 
         if updated:
             print(f"  [{table}] {updated}/{len(rows)} rows {'would be ' if dry_run else ''}updated.")
