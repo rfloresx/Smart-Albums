@@ -4,6 +4,12 @@ Renders a schema-driven form for the selected pipeline. The form is built
 recursively from the pipeline's config schema (same introspection used by
 the CLI) so adding a new stage or pipeline requires zero UI changes.
 
+Template Variables
+------------------
+Presets can define template variables (e.g. ``YEAR``) whose values are
+substituted into pipeline_settings at run time. Any string value containing
+``{VAR_NAME}`` will have placeholders replaced before the job is submitted.
+
 After submission the job is tracked as an async subprocess (see
 ``webgui.services.jobs``) and the user is redirected to the job history page.
 """
@@ -11,6 +17,8 @@ After submission the job is tracked as an async subprocess (see
 from __future__ import annotations
 
 import logging
+import re
+from collections.abc import Callable
 from typing import Any
 
 from nicegui import ui
@@ -22,6 +30,42 @@ from webgui.services import presets as presets_service
 from webgui.services import prompts as prompts_service
 
 logger = logging.getLogger(__name__)
+
+# Pattern matching a single {VAR_NAME} placeholder (used across validation and resolution)
+_TEMPLATE_PATTERN = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+# Pattern matching a valid variable name (without braces)
+_VAR_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _is_numeric(value: str) -> bool:
+    """Return True if the string represents a valid number."""
+    try:
+        float(value)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _step_value(element: Any, step: float, *, min_val: float | None = None, max_val: float | None = None) -> None:
+    """Increment or decrement a numeric input field's value by step, respecting optional bounds."""
+    raw = element.value
+    if not raw or not _is_numeric(str(raw)):
+        return
+    current = float(raw)
+    new_val = current + step
+    # Clamp to bounds if provided
+    if min_val is not None and new_val < min_val:
+        new_val = min_val
+    if max_val is not None and new_val > max_val:
+        new_val = max_val
+    # Keep as int if step is integer-sized
+    if step == int(step) and current == int(current):
+        element.value = str(int(new_val))
+    else:
+        # Round relative to step precision to avoid IEEE 754 artifacts
+        decimals = max(0, len(str(step).rstrip("0").split(".")[-1])) if "." in str(step) else 0
+        element.value = str(round(new_val, max(decimals, 2)))
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +111,9 @@ class _FormField:
         raw = self.element.value
         if raw is None or raw == "":
             return None
+        # Allow template variable references (e.g. "{YEAR}") in any field type
+        if isinstance(raw, str) and _TEMPLATE_PATTERN.fullmatch(raw):
+            return raw
         if self.kind == "bool":
             return bool(raw)
         if self.kind in ("int", "int_optional"):
@@ -82,7 +129,7 @@ class _FormField:
         return raw
 
 
-def _render_param(param: dict[str, Any]) -> _FormField | None:
+def _render_param(param: dict[str, Any], vars_getter: Callable[[], dict[str, str]] | None = None) -> _FormField | None:
     """Create a NiceGUI widget for a serialized ConfigParam dict."""
     key = param["key"]
     kind = _widget_kind(param)
@@ -93,6 +140,21 @@ def _render_param(param: dict[str, Any]) -> _FormField | None:
 
     if required:
         label += " *"
+
+    def _validate_numeric_or_var(value: str) -> bool:
+        """Allow empty, numeric, or a {VAR} that is defined in the variables table."""
+        if not value:
+            return True
+        if _is_numeric(value):
+            return True
+        if not _TEMPLATE_PATTERN.fullmatch(value):
+            return False
+        # Check that the variable is defined
+        if vars_getter:
+            var_name = value[1:-1]  # strip { and }
+            defined = vars_getter()
+            return var_name in defined
+        return True
 
     if kind == "select":
         choices = param["choices"]
@@ -115,21 +177,42 @@ def _render_param(param: dict[str, Any]) -> _FormField | None:
         element = ui.switch(label, value=bool(default) if default is not None else False)
 
     elif kind in ("int", "int_optional"):
-        element = ui.number(
+        step = 1
+        min_val = param.get("min")
+        max_val = param.get("max")
+        element = ui.input(
             label=label,
-            value=default,
-            min=param.get("min"),
-            max=param.get("max"),
+            value=str(default) if default is not None else "",
+            validation={"Must be a number or a defined {VARIABLE}": _validate_numeric_or_var},
         ).classes("w-full").props("outlined dense")
+        with element.add_slot("append"):
+            ui.button(
+                icon="arrow_drop_up",
+                on_click=lambda e, el=element, s=step, mn=min_val, mx=max_val: _step_value(el, s, min_val=mn, max_val=mx),
+            ).props("flat dense round size=xs")
+            ui.button(
+                icon="arrow_drop_down",
+                on_click=lambda e, el=element, s=step, mn=min_val, mx=max_val: _step_value(el, -s, min_val=mn, max_val=mx),
+            ).props("flat dense round size=xs")
 
     elif kind == "float":
-        element = ui.number(
+        step = param.get("step") or 0.01
+        min_val = param.get("min")
+        max_val = param.get("max")
+        element = ui.input(
             label=label,
-            value=default,
-            min=param.get("min"),
-            max=param.get("max"),
-            step=0.01,
+            value=str(default) if default is not None else "",
+            validation={"Must be a number or a defined {VARIABLE}": _validate_numeric_or_var},
         ).classes("w-full").props("outlined dense")
+        with element.add_slot("append"):
+            ui.button(
+                icon="arrow_drop_up",
+                on_click=lambda e, el=element, s=step, mn=min_val, mx=max_val: _step_value(el, s, min_val=mn, max_val=mx),
+            ).props("flat dense round size=xs")
+            ui.button(
+                icon="arrow_drop_down",
+                on_click=lambda e, el=element, s=step, mn=min_val, mx=max_val: _step_value(el, -s, min_val=mn, max_val=mx),
+            ).props("flat dense round size=xs")
 
     elif kind == "date":
         element = ui.input(
@@ -139,9 +222,20 @@ def _render_param(param: dict[str, Any]) -> _FormField | None:
         ).classes("w-full").props("outlined dense")
 
     else:
+        def _validate_str_vars(value: str) -> bool:
+            """For string fields, check that any {VAR} references are defined."""
+            if not value or not vars_getter:
+                return True
+            defined = vars_getter()
+            for match in _TEMPLATE_PATTERN.finditer(value):
+                if match.group(1) not in defined:
+                    return False
+            return True
+
         element = ui.input(
             label=label,
             value=str(default) if default is not None else "",
+            validation={"Undefined {VARIABLE} reference": _validate_str_vars},
         ).classes("w-full").props("outlined dense")
 
     if desc:
@@ -150,7 +244,7 @@ def _render_param(param: dict[str, Any]) -> _FormField | None:
     return _FormField(key=key, param=param, element=element, kind=kind)
 
 
-def _render_steps(steps: list[dict[str, Any]], path_prefix: str = "") -> list[dict[str, Any]]:
+def _render_steps(steps: list[dict[str, Any]], path_prefix: str = "", vars_getter: Callable[[], dict[str, str]] | None = None) -> list[dict[str, Any]]:
     """Recursively render pipeline steps into the current NiceGUI container.
 
     Top-level steps are rendered as labeled cards (always visible).
@@ -183,7 +277,7 @@ def _render_steps(steps: list[dict[str, Any]], path_prefix: str = "") -> list[di
             # Render parameter fields
             with ui.column().classes("w-full gap-1 q-mt-xs"):
                 for _key, param in params.items():
-                    field = _render_param(param)
+                    field = _render_param(param, vars_getter=vars_getter)
                     if field:
                         section["fields"].append(field)
 
@@ -197,6 +291,7 @@ def _render_steps(steps: list[dict[str, Any]], path_prefix: str = "") -> list[di
                         child_sections = _render_steps(
                             branch.get("steps", []),
                             path_prefix=branch_prefix,
+                            vars_getter=vars_getter,
                         )
                         section["children"].extend(child_sections)
 
@@ -243,6 +338,142 @@ def _apply_settings(
                 field.element.value = alias_settings[field.key]
         # Recurse into children
         _apply_settings(section["children"], pipeline_settings)
+
+
+# ---------------------------------------------------------------------------
+# Template variable resolution
+# ---------------------------------------------------------------------------
+
+
+def _resolve_variables(
+    pipeline_settings: dict[str, dict[str, Any]],
+    variables: dict[str, str],
+) -> dict[str, dict[str, Any]]:
+    """Replace {VAR} placeholders in all string values within pipeline_settings.
+
+    Only replaces variables that are defined in the variables dict.
+    Unresolved placeholders are left as-is.
+
+    Note: Only resolves one level deep (alias → flat key/value dict).
+    Nested dict values are not recursed into.
+    """
+    if not variables:
+        return pipeline_settings
+
+    def _substitute(value: Any) -> Any:
+        if isinstance(value, str):
+            def _replace(m: re.Match) -> str:
+                var_name = m.group(1)
+                return variables.get(var_name, m.group(0))
+            return _TEMPLATE_PATTERN.sub(_replace, value)
+        return value
+
+    resolved: dict[str, dict[str, Any]] = {}
+    for alias, settings in pipeline_settings.items():
+        if isinstance(settings, dict):
+            resolved[alias] = {k: _substitute(v) for k, v in settings.items()}
+        else:
+            resolved[alias] = _substitute(settings)
+    return resolved
+
+
+def _find_undefined_variables(
+    pipeline_settings: dict[str, Any],
+    variables: dict[str, str],
+) -> set[str]:
+    """Return the set of {VAR} names used in settings that are not defined in variables."""
+    defined = set(variables.keys())
+    used: set[str] = set()
+
+    for _alias, settings in pipeline_settings.items():
+        if isinstance(settings, dict):
+            for v in settings.values():
+                if isinstance(v, str):
+                    used.update(_TEMPLATE_PATTERN.findall(v))
+        elif isinstance(settings, str):
+            used.update(_TEMPLATE_PATTERN.findall(settings))
+
+    return used - defined
+
+
+# ---------------------------------------------------------------------------
+# Template Variables UI component
+# ---------------------------------------------------------------------------
+
+
+class _TemplateVariablesEditor:
+    """Expandable section for editing template variables (name/value pairs)."""
+
+    def __init__(self) -> None:
+        self._rows: list[dict[str, Any]] = []
+
+        with ui.expansion("Template Variables", icon="data_object").classes("w-full"):
+            self._container = ui.column().classes("w-full gap-2")
+            with ui.row().classes("w-full justify-start q-mt-sm"):
+                ui.button("Add variable", icon="add", on_click=self._add_row).props(
+                    "flat size=sm color=primary"
+                )
+
+    @staticmethod
+    def _validate_var_name(value: str) -> bool:
+        """Validate that variable name matches [A-Za-z_][A-Za-z0-9_]*."""
+        if not value:
+            return True  # empty is handled by get_variables (skips empty)
+        return bool(_VAR_NAME_PATTERN.match(value))
+
+    def _add_row(self, name: str = "", value: str = "") -> None:
+        """Add a variable row to the editor."""
+        row_data: dict[str, Any] = {}
+
+        with self._container:
+            with ui.row().classes("w-full items-center gap-2") as row_el:
+                name_input = ui.input(
+                    label="Variable name",
+                    value=name,
+                    placeholder="e.g. YEAR",
+                    validation={
+                        "Must be letters, digits, underscores (start with letter/_)":
+                            self._validate_var_name
+                    },
+                ).classes("w-40").props("outlined dense")
+                value_input = ui.input(
+                    label="Value",
+                    value=value,
+                    placeholder="e.g. 2025",
+                ).classes("flex-grow").props("outlined dense")
+                ui.button(
+                    icon="remove",
+                    on_click=lambda r=row_data: self._remove_row(r),
+                ).props("flat round size=sm color=negative")
+
+        row_data["row_el"] = row_el
+        row_data["name_input"] = name_input
+        row_data["value_input"] = value_input
+        self._rows.append(row_data)
+
+    def _remove_row(self, row_data: dict[str, Any]) -> None:
+        """Remove a variable row."""
+        self._container.remove(row_data["row_el"])
+        self._rows.remove(row_data)
+
+    def get_variables(self) -> dict[str, str]:
+        """Collect current variable name→value mappings (skipping empty names)."""
+        variables: dict[str, str] = {}
+        for row in self._rows:
+            name = (row["name_input"].value or "").strip()
+            value = row["value_input"].value or ""
+            if name:
+                variables[name] = value
+        return variables
+
+    def set_variables(self, variables: dict[str, str]) -> None:
+        """Replace the current rows with the given variables dict."""
+        # Clear existing rows
+        self._container.clear()
+        self._rows.clear()
+        # Add rows for each variable
+        for name, value in variables.items():
+            self._add_row(name, value)
 
 
 # ---------------------------------------------------------------------------
@@ -332,10 +563,13 @@ async def new_job_page() -> None:
             # Rebuild form, then apply saved values
             build_form()
             _apply_settings(current_sections, preset["pipeline_settings"])
+            # Load template variables from preset
+            template_vars_editor.set_variables(preset.get("template_variables") or {})
             ui.notify(f"Loaded preset: {preset['name']}", type="info")
 
         async def save_preset() -> None:
             pipeline_settings = _collect_values(current_sections)
+            template_variables = template_vars_editor.get_variables()
             pipeline_name = pipeline_select.value
 
             # Dialog for preset name
@@ -350,7 +584,8 @@ async def new_job_page() -> None:
                 async def do_save() -> None:
                     try:
                         await presets_service.save_preset(
-                            pipeline_name, name_input.value or "", pipeline_settings
+                            pipeline_name, name_input.value or "", pipeline_settings,
+                            template_variables=template_variables,
                         )
                         ui.notify("Preset saved", type="positive")
                         dlg.close()
@@ -378,6 +613,9 @@ async def new_job_page() -> None:
             except presets_service.PresetError as exc:
                 ui.notify(str(exc), type="negative")
 
+        # --- Template Variables editor (between preset bar and form) ---
+        template_vars_editor = _TemplateVariablesEditor()
+
         # Form area — use a column that we clear and rebuild
         form_container = ui.column().classes("w-full gap-1")
 
@@ -388,7 +626,10 @@ async def new_job_page() -> None:
             desc_label.text = schemas[name].get("description", "")
             schema_tree = schemas[name]["schema"]
             with form_container:
-                current_sections = _render_steps(schema_tree)
+                current_sections = _render_steps(
+                    schema_tree,
+                    vars_getter=template_vars_editor.get_variables,
+                )
 
         async def on_pipeline_change(_) -> None:
             build_form()
@@ -412,8 +653,26 @@ async def new_job_page() -> None:
         # Submit button
         async def submit() -> None:
             pipeline_settings = _collect_values(current_sections)
-            pipeline_settings["_log_level"] = log_level_select.value
             pipeline_name = pipeline_select.value
+
+            # Verify all {VAR} references are defined in the variables table
+            variables = template_vars_editor.get_variables()
+            undefined = _find_undefined_variables(pipeline_settings, variables)
+            if undefined:
+                names = ", ".join(f"{{{v}}}" for v in sorted(undefined))
+                ui.notify(
+                    f"Undefined template variables: {names}",
+                    type="negative",
+                )
+                return
+
+            # Resolve template variables in settings
+            if variables:
+                pipeline_settings = _resolve_variables(pipeline_settings, variables)
+
+            # Inject log level after variable resolution (not a user-configurable template field)
+            pipeline_settings["_log_level"] = log_level_select.value
+
             logger.info(
                 "Submitting job: pipeline=%s settings=%s",
                 pipeline_name, pipeline_settings,

@@ -101,8 +101,22 @@ class Database:
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute("PRAGMA foreign_keys=ON")
         await self._db.executescript(_SCHEMA_SQL)
+        await self._apply_migrations()
         await self._db.commit()
         logger.info("Database connected: %s", self._db_path)
+
+    async def _apply_migrations(self) -> None:
+        """Apply incremental schema migrations for columns added after initial release."""
+        assert self._db is not None
+
+        # Add template_variables column to presets (stores JSON dict of variable definitions)
+        cursor = await self._db.execute("PRAGMA table_info(presets)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        if "template_variables" not in columns:
+            await self._db.execute(
+                "ALTER TABLE presets ADD COLUMN template_variables TEXT NOT NULL DEFAULT '{}'"
+            )
+            logger.info("Migration: added template_variables column to presets")
 
     async def close(self) -> None:
         """Close the database connection."""
@@ -299,14 +313,16 @@ class Database:
         pipeline: str,
         name: str,
         pipeline_settings: dict[str, Any],
+        template_variables: dict[str, str] | None = None,
     ) -> None:
         """Insert a new preset."""
         assert self._db is not None
         now = datetime.now(timezone.utc).isoformat()
         await self._db.execute(
-            """INSERT INTO presets (id, pipeline, name, pipeline_settings, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (preset_id, pipeline, name, json.dumps(pipeline_settings), now, now),
+            """INSERT INTO presets (id, pipeline, name, pipeline_settings, template_variables, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (preset_id, pipeline, name, json.dumps(pipeline_settings),
+             json.dumps(template_variables or {}), now, now),
         )
         await self._db.commit()
 
@@ -314,12 +330,14 @@ class Database:
         self,
         preset_id: str,
         pipeline_settings: dict[str, Any],
+        template_variables: dict[str, str] | None = None,
     ) -> None:
-        """Update an existing preset's settings."""
+        """Update an existing preset's settings and template variables."""
         assert self._db is not None
         await self._db.execute(
-            "UPDATE presets SET pipeline_settings=?, updated_at=? WHERE id=?",
-            (json.dumps(pipeline_settings), datetime.now(timezone.utc).isoformat(), preset_id),
+            "UPDATE presets SET pipeline_settings=?, template_variables=?, updated_at=? WHERE id=?",
+            (json.dumps(pipeline_settings), json.dumps(template_variables or {}),
+             datetime.now(timezone.utc).isoformat(), preset_id),
         )
         await self._db.commit()
 
@@ -340,6 +358,7 @@ class Database:
                 "pipeline": row["pipeline"],
                 "name": row["name"],
                 "pipeline_settings": json.loads(row["pipeline_settings"]),
+                "template_variables": json.loads(row["template_variables"]) if row["template_variables"] else {},
                 "created_at": row["created_at"],
                 "updated_at": row["updated_at"],
             }
@@ -358,6 +377,7 @@ class Database:
             "pipeline": row["pipeline"],
             "name": row["name"],
             "pipeline_settings": json.loads(row["pipeline_settings"]),
+            "template_variables": json.loads(row["template_variables"]) if row["template_variables"] else {},
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
