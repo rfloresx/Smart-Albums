@@ -20,6 +20,12 @@ from typing import Any
 
 from smart_albums.core.context import PipelineContext, ContextBatch
 from smart_albums.core.node import Stage, ConfigParam
+from smart_albums.core.protocols import (
+    ICacheManager,
+    IEmbeddingClient,
+    IImageClient,
+    ProtocolsRegistry,
+)
 from smart_albums.core.registry import stage
 
 logger = logging.getLogger(__name__)
@@ -57,7 +63,8 @@ class AnalyzeEmbedding(Stage):
     )
 
     async def run(self, ctx: PipelineContext) -> ContextBatch:
-        if ctx.embedding_client is None:
+        embedding_client = ProtocolsRegistry.get_instance(IEmbeddingClient)
+        if embedding_client is None:
             logger.warning("No embedding_client configured, skipping embedding stage")
             return [ctx]
 
@@ -66,7 +73,7 @@ class AnalyzeEmbedding(Stage):
             _zero_stats(ctx)
             return [ctx]
 
-        model: str = ctx.embedding_client.embed_model
+        model: str = embedding_client.embed_model
         concurrency: int = self.get("concurrency")
         batch_size: int = self.get("batch_size")
 
@@ -75,9 +82,10 @@ class AnalyzeEmbedding(Stage):
             len(ctx.assets), model, concurrency, batch_size,
         )
 
+        cache_manager = ProtocolsRegistry.get_instance(ICacheManager)
         cache = None
-        if ctx.cache_manager:
-            cache = ctx.cache_manager.get_cache(self.name)
+        if cache_manager:
+            cache = cache_manager.get_cache(self.name)
             logger.debug("Cache enabled for stage %r", self.name)
         else:
             logger.debug("No cache_manager on context — cache disabled")
@@ -117,6 +125,9 @@ class AnalyzeEmbedding(Stage):
             batch_size: Images per forward pass.
             cache: Optional cache instance.
         """
+        image_client = ProtocolsRegistry.get_instance(IImageClient)
+        embedding_client = ProtocolsRegistry.get_instance(IEmbeddingClient)
+
         computed = 0
         cached_count = 0
         failures = 0
@@ -155,9 +166,9 @@ class AnalyzeEmbedding(Stage):
         async def _fetch(asset: Any) -> tuple[str, bytes | None]:
             async with semaphore:
                 try:
-                    if ctx.image_client is None:
+                    if image_client is None:
                         raise RuntimeError("image_client is required for stage 'analyze.embedding'")
-                    data = await ctx.image_client.get_asset_thumbnail(asset.id)
+                    data = await image_client.get_asset_thumbnail(asset.id)
                     logger.debug(
                         "Thumbnail fetched for asset %s: %d bytes", asset.id, len(data)
                     )
@@ -222,10 +233,10 @@ class AnalyzeEmbedding(Stage):
             )
 
             try:
-                if ctx.embedding_client is None:
+                if embedding_client is None:
                     raise RuntimeError("embedding_client is required for stage 'analyze.embedding'")
                 embeddings: list[list[float] | None] = (
-                    await ctx.embedding_client.embed_batch(chunk_bytes)
+                    await embedding_client.embed_batch(chunk_bytes)
                 )
             except Exception as exc:
                 logger.warning(
@@ -281,6 +292,9 @@ class AnalyzeEmbedding(Stage):
             concurrency: Max concurrent embed() calls.
             cache: Optional cache instance.
         """
+        image_client = ProtocolsRegistry.get_instance(IImageClient)
+        embedding_client = ProtocolsRegistry.get_instance(IEmbeddingClient)
+
         semaphore = asyncio.Semaphore(concurrency)
         computed = 0
         cached_count = 0
@@ -302,16 +316,16 @@ class AnalyzeEmbedding(Stage):
 
                 try:
                     logger.debug("Sequential path: fetching thumbnail for asset %s", asset.id)
-                    if ctx.image_client is None:
+                    if image_client is None:
                         raise RuntimeError("image_client is required for stage 'analyze.embedding'")
-                    image_bytes = await ctx.image_client.get_asset_thumbnail(asset.id)
+                    image_bytes = await image_client.get_asset_thumbnail(asset.id)
                     logger.debug(
                         "Sequential path: embedding asset %s (%d bytes)",
                         asset.id, len(image_bytes),
                     )
-                    if ctx.embedding_client is None:
+                    if embedding_client is None:
                         raise RuntimeError("embedding_client is required for stage 'analyze.embedding'")
-                    embedding = await ctx.embedding_client.embed(image_bytes)
+                    embedding = await embedding_client.embed(image_bytes)
                     asset.metadata["embedding"] = embedding
                     logger.debug(
                         "Embedded asset %s: vector dim=%d", asset.id, len(embedding)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from smart_albums.core.context import PipelineContext, ContextBatch
 from smart_albums.core.node import Stage, ConfigParam
+from smart_albums.core.protocols import IProgressReporter, ProtocolsRegistry
 from smart_albums.core.registry import stage
 
 
@@ -33,8 +34,10 @@ class FilterMinScore(Stage):
         ]
         excluded = before - len(ctx.assets)
         ctx.stats["filter.min_score.excluded"] = excluded
-        if ctx.progress and excluded:
-            ctx.progress.log(
-                f"Excluded {excluded} asset(s) below score {threshold:.2f}."
-            )
+        if excluded:
+            progress = ProtocolsRegistry.get_instance(IProgressReporter)
+            if progress:
+                progress.log(
+                    f"Excluded {excluded} asset(s) below score {threshold:.2f}."
+                )
         return [ctx]

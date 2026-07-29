@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
-
 from smart_albums.core.context import PipelineContext, ContextBatch
-from smart_albums.core.models import Asset
 
 from conftest import make_asset, make_context
 
@@ -19,10 +16,6 @@ class TestPipelineContext:
         assert ctx.assets == []
         assert ctx.stats == {}
         assert ctx.metadata == {}
-        assert ctx.image_client is None
-        assert ctx.llm_client is None
-        assert ctx.embedding_client is None
-        assert ctx.progress is None
         assert ctx.partition_name == ""
         assert ctx.partition_id == ""
         assert ctx.parent_partition_id is None

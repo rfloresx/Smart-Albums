@@ -129,8 +129,7 @@ class TestAnalyzeScore:
         client = FakeImageClient()
         llm = FakeLLMClient(response={"score": 0.1, "is_screenshot": True})
         assets = [make_asset(id="a1")]
-        ctx = make_context(assets=assets, image_client=client, llm_client=llm)
-        ctx.cache_manager = cache_manager
+        ctx = make_context(assets=assets, image_client=client, llm_client=llm, cache_manager=cache_manager)
         node = AnalyzeScore({"prompt_file": prompt_file})
         result = await node.run(ctx)
         # Should get cached value, not LLM value
@@ -144,8 +143,7 @@ class TestAnalyzeScore:
         llm = FakeLLMClient()
         progress = FakeProgress()
         assets = [make_asset(id="a1"), make_asset(id="a2")]
-        ctx = make_context(assets=assets, image_client=client, llm_client=llm)
-        ctx.progress = progress
+        ctx = make_context(assets=assets, image_client=client, llm_client=llm, progress=progress)
         node = AnalyzeScore({"prompt_file": prompt_file})
         await node.run(ctx)
         assert "Scoring assets" in progress.stages

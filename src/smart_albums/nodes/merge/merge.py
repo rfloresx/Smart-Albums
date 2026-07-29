@@ -82,11 +82,6 @@ def merge_concat(contexts: ContextBatch) -> PipelineContext:
         # Single context — still reduce depth by one level
         return PipelineContext(
             config=first.config,
-            image_client=first.image_client,
-            llm_client=first.llm_client,
-            embedding_client=first.embedding_client,
-            progress=first.progress,
-            cache_manager=first.cache_manager,
             assets=first.assets,
             stats=first.stats,
             metadata=first.metadata,
@@ -108,11 +103,6 @@ def merge_concat(contexts: ContextBatch) -> PipelineContext:
     # (one level up from the branches)
     return PipelineContext(
         config=first.config,
-        image_client=first.image_client,
-        llm_client=first.llm_client,
-        embedding_client=first.embedding_client,
-        progress=first.progress,
-        cache_manager=first.cache_manager,
         assets=merged_assets,
         stats=merged_stats,
         metadata=first.metadata,

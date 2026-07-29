@@ -23,6 +23,7 @@ from PIL import Image, ImageFilter
 from smart_albums.core.context import PipelineContext, ContextBatch
 from smart_albums.core.models import Asset
 from smart_albums.core.node import Stage
+from smart_albums.core.protocols import IImageClient, ProtocolsRegistry
 from smart_albums.core.registry import stage
 
 logger = logging.getLogger(__name__)
@@ -120,6 +121,7 @@ class SelectBest(Stage):
 
         Falls back to score-only if thumbnails cannot be fetched.
         """
+        image_client = ProtocolsRegistry.get_instance(IImageClient)
         scored: list[tuple[Asset, float, int]] = []
 
         for asset in ctx.assets:
@@ -127,9 +129,9 @@ class SelectBest(Stage):
             sharpness = 0.0
 
             # Try to compute sharpness from thumbnail
-            if ctx.image_client is not None:
+            if image_client is not None:
                 try:
-                    thumbnail = await ctx.image_client.get_asset_thumbnail(asset.id)
+                    thumbnail = await image_client.get_asset_thumbnail(asset.id)
                     sharpness = _compute_sharpness(thumbnail)
                 except Exception:
                     logger.debug(

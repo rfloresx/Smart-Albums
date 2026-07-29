@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from smart_albums.core.context import PipelineContext, ContextBatch
 from smart_albums.core.node import Stage, ConfigParam
+from smart_albums.core.protocols import IImageClient, IProgressReporter, ProtocolsRegistry
 from smart_albums.core.registry import stage
 
 
@@ -27,19 +28,21 @@ class PublishCreateAlbum(Stage):
             return [ctx]
 
         # Conflict detection via album listing
-        if ctx.image_client is None:
+        image_client = ProtocolsRegistry.get_instance(IImageClient)
+        if image_client is None:
             raise RuntimeError("image_client is required for stage 'publish.create_album'")
 
-        albums = await ctx.image_client.list_albums()
+        albums = await image_client.list_albums()
         for album in albums:
             if album.name == name:
                 ctx.stats["publish.create_album.conflict"] = True
                 ctx.stats["publish.create_album.created"] = False
-                if ctx.progress:
-                    ctx.progress.warn(f"Album {name!r} already exists.")
+                progress = ProtocolsRegistry.get_instance(IProgressReporter)
+                if progress:
+                    progress.warn(f"Album {name!r} already exists.")
                 return [ctx]
 
-        result = await ctx.image_client.create_album(name, asset_ids)
+        result = await image_client.create_album(name, asset_ids)
         ctx.stats["publish.create_album.created"] = True
         ctx.stats["publish.create_album.name"] = name
         ctx.stats["publish.create_album.url"] = result.url

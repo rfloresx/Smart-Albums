@@ -6,23 +6,14 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from smart_albums.core.models import Asset
-from smart_albums.core.protocols import (
-    IEmbeddingClient,
-    IImageClient,
-    ILLMClient,
-    IProgressReporter,
-    ICacheManager
-)
 
 
 @dataclass
 class PipelineContext:
     """The single mutable state bag that flows through all stages.
 
-    Stages read configuration from `config`, interact with external services
-    via `image_client`, `llm_client`, and `embedding_client`, report progress
-    through `progress`, and mutate the `assets` list. The `stats` dict
-    accumulates pipeline-level metrics (timing, counts, etc.).
+    Stages read configuration from `config`, mutate the `assets` list,
+    and accumulate pipeline-level metrics in `stats`.
 
     Partition tracking fields (`partition_name`, `partition_id`,
     `parent_partition_id`, `partition_depth`) record where this context sits
@@ -30,11 +21,6 @@ class PipelineContext:
     """
 
     config: dict[str, Any] = field(default_factory=dict)
-    image_client: IImageClient | None = None
-    llm_client: ILLMClient | None = None
-    embedding_client: IEmbeddingClient | None = None
-    progress: IProgressReporter | None = None
-    cache_manager: ICacheManager | None = None
 
     assets: list[Asset] = field(default_factory=list)
     stats: dict[str, Any] = field(default_factory=dict)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from smart_albums.core.context import PipelineContext, ContextBatch
 from smart_albums.core.node import Stage
+from smart_albums.core.protocols import IProgressReporter, ProtocolsRegistry
 from smart_albums.core.registry import stage
 
 
@@ -16,6 +17,8 @@ class FilterScreenshots(Stage):
         ctx.assets = [a for a in ctx.assets if not a.metadata.get("is_screenshot")]
         excluded = before - len(ctx.assets)
         ctx.stats["filter.screenshots.excluded"] = excluded
-        if ctx.progress and excluded:
-            ctx.progress.log(f"Excluded {excluded} screenshot(s).")
+        if excluded:
+            progress = ProtocolsRegistry.get_instance(IProgressReporter)
+            if progress:
+                progress.log(f"Excluded {excluded} screenshot(s).")
         return [ctx]

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from smart_albums.core.context import PipelineContext, ContextBatch
 from smart_albums.core.node import Stage, ConfigParam
+from smart_albums.core.protocols import IImageClient, ProtocolsRegistry
 from smart_albums.core.registry import stage
 
 
@@ -31,14 +32,15 @@ class PublishReplaceAlbum(Stage):
         dry_run = self.get("dry_run")
         desired = {a.id for a in ctx.assets}
 
-        if ctx.image_client is None:
+        image_client = ProtocolsRegistry.get_instance(IImageClient)
+        if image_client is None:
             raise RuntimeError("image_client is required for stage 'publish.replace_album'")
-        album = await ctx.image_client.get_album_by_name(name)
+        album = await image_client.get_album_by_name(name)
         if album is None:
             current: set[str] = set()
             created = True
         else:
-            current = {a.id for a in await ctx.image_client.list_album_assets(album.id)}
+            current = {a.id for a in await image_client.list_album_assets(album.id)}
             created = False
 
         to_add = desired - current
@@ -51,16 +53,16 @@ class PublishReplaceAlbum(Stage):
             return [ctx]
 
         if created:
-            result = await ctx.image_client.create_album(name, list(desired))
+            result = await image_client.create_album(name, list(desired))
             album_id = result.id
         else:
             # album is guaranteed non-None when created is False
             album_id = album.id  # type: ignore[union-attr]
 
         if to_add:
-            await ctx.image_client.add_assets_to_album(album_id, list(to_add))
+            await image_client.add_assets_to_album(album_id, list(to_add))
         if to_remove:
-            await ctx.image_client.remove_assets_from_album(album_id, list(to_remove))
+            await image_client.remove_assets_from_album(album_id, list(to_remove))
 
         ctx.stats["publish.replace_album.created"] = created
         ctx.stats["publish.replace_album.added"] = len(to_add)

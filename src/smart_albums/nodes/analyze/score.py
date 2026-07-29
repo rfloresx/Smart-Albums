@@ -9,6 +9,13 @@ from typing import Any
 
 from smart_albums.core.context import PipelineContext, ContextBatch
 from smart_albums.core.node import Stage, ConfigParam
+from smart_albums.core.protocols import (
+    ICacheManager,
+    IImageClient,
+    ILLMClient,
+    IProgressReporter,
+    ProtocolsRegistry,
+)
 from smart_albums.core.registry import stage
 
 logger = logging.getLogger(__name__)
@@ -71,15 +78,20 @@ class AnalyzeScore(Stage):
             prompt_file, prompt_hash, len(prompt),
         )
 
+        cache_manager = ProtocolsRegistry.get_instance(ICacheManager)
         cache = None
-        if ctx.cache_manager:
-            cache = ctx.cache_manager.get_cache(self.name)
+        if cache_manager:
+            cache = cache_manager.get_cache(self.name)
             logger.debug("Cache enabled for stage %r", self.name)
         else:
             logger.debug("No cache_manager on context — cache disabled")
 
-        if ctx.progress:
-            ctx.progress.start_stage("Scoring assets", total=len(ctx.assets))
+        progress = ProtocolsRegistry.get_instance(IProgressReporter)
+        image_client = ProtocolsRegistry.get_instance(IImageClient)
+        llm_client = ProtocolsRegistry.get_instance(ILLMClient)
+
+        if progress:
+            progress.start_stage("Scoring assets", total=len(ctx.assets))
 
         semaphore = asyncio.Semaphore(concurrency)
         computed = 0
@@ -100,16 +112,16 @@ class AnalyzeScore(Stage):
                     asset.metadata.update(hit)
                     async with lock:
                         cached += 1
-                    if ctx.progress:
-                        ctx.progress.advance()
+                    if progress:
+                        progress.advance()
                     return
 
             async with semaphore:
                 try:
                     logger.debug("Fetching thumbnail for asset %s", asset.id)
-                    if ctx.image_client is None:
+                    if image_client is None:
                         raise RuntimeError("image_client is required for stage 'analyze.score'")
-                    thumbnail = await ctx.image_client.get_asset_thumbnail(asset.id)
+                    thumbnail = await image_client.get_asset_thumbnail(asset.id)
                     logger.debug(
                         "Thumbnail fetched for asset %s: %d bytes", asset.id, len(thumbnail)
                     )
@@ -117,9 +129,9 @@ class AnalyzeScore(Stage):
                     schema = {"score": "float", "is_screenshot": "bool"}
 
                     logger.debug("Sending asset %s to LLM for analysis", asset.id)
-                    if ctx.llm_client is None:
+                    if llm_client is None:
                         raise RuntimeError("llm_client is required for stage 'analyze.score'")
-                    result = await ctx.llm_client.analyze_image(
+                    result = await llm_client.analyze_image(
                         thumbnail, prompt, schema
                     )
                     logger.debug("LLM result for asset %s: %s", asset.id, result)
@@ -187,14 +199,14 @@ class AnalyzeScore(Stage):
                     async with lock:
                         failures += 1
 
-            if ctx.progress:
-                ctx.progress.advance()
+            if progress:
+                progress.advance()
 
         tasks = [_analyze_one(asset) for asset in ctx.assets]
         await asyncio.gather(*tasks)
 
-        if ctx.progress:
-            ctx.progress.finish_stage()
+        if progress:
+            progress.finish_stage()
 
         ctx.stats["analyze.score.total_assets"] = len(ctx.assets)
         ctx.stats["analyze.score.computed"] = computed

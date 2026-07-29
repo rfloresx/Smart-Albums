@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from datetime import datetime, date
 from typing import Any
-from dataclasses import field
 
 import pytest
 
@@ -13,11 +12,26 @@ from smart_albums.core.context import PipelineContext
 from smart_albums.core.protocols import (
     AlbumResult,
     AlbumSummary,
+    ICacheManager,
+    IEmbeddingClient,
     IImageClient,
     ILLMClient,
-    IEmbeddingClient,
     IProgressReporter,
+    ProtocolsRegistry,
 )
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _clean_protocol_instances():
+    """Ensure ProtocolsRegistry instances are cleared between every test."""
+    ProtocolsRegistry.clear_instances()
+    yield
+    ProtocolsRegistry.clear_instances()
 
 
 # ---------------------------------------------------------------------------
@@ -64,14 +78,28 @@ def make_context(
     image_client: IImageClient | None = None,
     llm_client: ILLMClient | None = None,
     embedding_client: IEmbeddingClient | None = None,
+    cache_manager: Any = None,
+    progress: IProgressReporter | None = None,
     stats: dict[str, Any] | None = None,
 ) -> PipelineContext:
-    """Create a PipelineContext with sensible defaults for testing."""
+    """Create a PipelineContext with sensible defaults for testing.
+
+    Also registers provided protocol instances in ProtocolsRegistry so that
+    nodes using the registry-based lookup can find them.
+    """
+    if image_client is not None:
+        ProtocolsRegistry.set_instance(IImageClient, image_client)
+    if llm_client is not None:
+        ProtocolsRegistry.set_instance(ILLMClient, llm_client)
+    if embedding_client is not None:
+        ProtocolsRegistry.set_instance(IEmbeddingClient, embedding_client)
+    if cache_manager is not None:
+        ProtocolsRegistry.set_instance(ICacheManager, cache_manager)
+    if progress is not None:
+        ProtocolsRegistry.set_instance(IProgressReporter, progress)
+
     return PipelineContext(
         config=config or {},
-        image_client=image_client,
-        llm_client=llm_client,
-        embedding_client=embedding_client,
         assets=assets or [],
         stats=stats or {},
     )

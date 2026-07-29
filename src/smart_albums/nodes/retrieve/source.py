@@ -10,6 +10,7 @@ from datetime import date
 
 from smart_albums.core.context import PipelineContext, ContextBatch
 from smart_albums.core.node import Stage, ConfigParam
+from smart_albums.core.protocols import IImageClient, ProtocolsRegistry
 from smart_albums.core.registry import stage
 from smart_albums.nodes.retrieve._sources import build_source
 
@@ -44,9 +45,10 @@ class Source(Stage):
         run_date = self.get("run_date")
 
         provider = build_source(spec)
-        if ctx.image_client is None:
+        image_client = ProtocolsRegistry.get_instance(IImageClient)
+        if image_client is None:
             raise RuntimeError("image_client is required for stage 'source'")
-        fetched = await provider.fetch(ctx.image_client, run_date)
+        fetched = await provider.fetch(image_client, run_date)
 
         ctx.assets.extend(fetched)
         ctx.stats["source.total_retrieved"] = len(fetched)

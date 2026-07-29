@@ -5,6 +5,7 @@ from __future__ import annotations
 from smart_albums.core.context import PipelineContext, ContextBatch
 from smart_albums.core.models import Asset
 from smart_albums.core.node import Stage, ConfigParam
+from smart_albums.core.protocols import IImageClient, IProgressReporter, ProtocolsRegistry
 from smart_albums.core.registry import stage
 
 
@@ -33,13 +34,14 @@ class FilterSensitive(Stage):
             return [ctx]
 
         # 1. Fetch negative-query matches
-        if ctx.image_client is None:
+        image_client = ProtocolsRegistry.get_instance(IImageClient)
+        if image_client is None:
             raise RuntimeError("image_client is required for stage 'filter.sensitive'")
 
         excluded_ids: dict[str, list[str]] = {}  # asset_id -> [signals]
         for query in self.get("negative_queries") or []:
             limit = self.get("negative_query_limit")
-            for hit in await ctx.image_client.search_smart(query, limit):
+            for hit in await image_client.search_smart(query, limit):
                 excluded_ids.setdefault(hit.id, []).append("negative_query")
 
         # 2. Apply blocklist / blocked tags / vision flags / fail_closed
@@ -86,6 +88,8 @@ class FilterSensitive(Stage):
         ctx.stats["filter.sensitive.excluded"] = excluded
         for signal, count in tally.items():
             ctx.stats[f"filter.sensitive.excluded.{signal}"] = count
-        if ctx.progress and excluded:
-            ctx.progress.log(f"Excluded {excluded} sensitive asset(s).")
+        if excluded:
+            progress = ProtocolsRegistry.get_instance(IProgressReporter)
+            if progress:
+                progress.log(f"Excluded {excluded} sensitive asset(s).")
         return [ctx]

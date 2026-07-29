@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from smart_albums.core.context import PipelineContext, ContextBatch
 from smart_albums.core.node import Stage
+from smart_albums.core.protocols import IProgressReporter, ProtocolsRegistry
 from smart_albums.core.registry import stage
 
 
@@ -16,6 +17,8 @@ class RetainImages(Stage):
         ctx.assets = [a for a in ctx.assets if a.mime_type.lower().startswith("image/")]
         excluded = before - len(ctx.assets)
         ctx.stats["filter.non_images.excluded"] = excluded
-        if ctx.progress and excluded:
-            ctx.progress.log(f"Excluded {excluded} non-image asset(s).")
+        if excluded:
+            progress = ProtocolsRegistry.get_instance(IProgressReporter)
+            if progress:
+                progress.log(f"Excluded {excluded} non-image asset(s).")
         return [ctx]

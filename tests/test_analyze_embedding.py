@@ -90,15 +90,13 @@ class TestAnalyzeEmbedding:
     async def test_no_embedding_client_skips(self):
         assets = [make_asset(id="a1")]
         ctx = make_context(assets=assets)
-        ctx.embedding_client = None
         node = AnalyzeEmbedding({})
         result = await node.run(ctx)
         assert "embedding" not in result[0].assets[0].metadata
 
     @pytest.mark.asyncio
     async def test_empty_assets_zero_stats(self):
-        ctx = make_context(assets=[])
-        ctx.embedding_client = _BatchEmbeddingClient()
+        ctx = make_context(assets=[], embedding_client=_BatchEmbeddingClient())
         node = AnalyzeEmbedding({})
         result = await node.run(ctx)
         assert result[0].stats["analyze.embedding.total_assets"] == 0
@@ -109,8 +107,7 @@ class TestAnalyzeEmbedding:
         client = FakeImageClient()
         embed_client = _BatchEmbeddingClient()
         assets = [make_asset(id="a1"), make_asset(id="a2")]
-        ctx = make_context(assets=assets, image_client=client)
-        ctx.embedding_client = embed_client
+        ctx = make_context(assets=assets, image_client=client, embedding_client=embed_client)
         node = AnalyzeEmbedding({})
         result = await node.run(ctx)
         # batch path used
@@ -126,8 +123,7 @@ class TestAnalyzeEmbedding:
         client = FakeImageClient()
         embed_client = _SequentialEmbeddingClient()
         assets = [make_asset(id="a1"), make_asset(id="a2")]
-        ctx = make_context(assets=assets, image_client=client)
-        ctx.embedding_client = embed_client
+        ctx = make_context(assets=assets, image_client=client, embedding_client=embed_client)
         node = AnalyzeEmbedding({})
         result = await node.run(ctx)
         # batch path used (embed_batch delegates to embed internally)
@@ -144,9 +140,7 @@ class TestAnalyzeEmbedding:
 
         client = FakeImageClient()
         assets = [make_asset(id="a1")]
-        ctx = make_context(assets=assets, image_client=client)
-        ctx.embedding_client = embed_client
-        ctx.cache_manager = cache_manager
+        ctx = make_context(assets=assets, image_client=client, embedding_client=embed_client, cache_manager=cache_manager)
         node = AnalyzeEmbedding({})
         result = await node.run(ctx)
         assert result[0].assets[0].metadata["embedding"] == cached_embedding
@@ -162,8 +156,7 @@ class TestAnalyzeEmbedding:
         embed_client = _SequentialEmbeddingClient()
         client = FailingImageClient()
         assets = [make_asset(id="a1")]
-        ctx = make_context(assets=assets, image_client=client)
-        ctx.embedding_client = embed_client
+        ctx = make_context(assets=assets, image_client=client, embedding_client=embed_client)
         node = AnalyzeEmbedding({})
         result = await node.run(ctx)
         assert "error" in result[0].assets[0].metadata
@@ -179,8 +172,7 @@ class TestAnalyzeEmbedding:
         embed_client = _SequentialEmbeddingClient()
         client = NotFoundImageClient()
         assets = [make_asset(id="a1")]
-        ctx = make_context(assets=assets, image_client=client)
-        ctx.embedding_client = embed_client
+        ctx = make_context(assets=assets, image_client=client, embedding_client=embed_client)
         node = AnalyzeEmbedding({})
         result = await node.run(ctx)
         assert "error" in result[0].assets[0].metadata
@@ -195,9 +187,7 @@ class TestAnalyzeEmbedding:
 
         client = FakeImageClient()
         assets = [make_asset(id="a1"), make_asset(id="a2")]
-        ctx = make_context(assets=assets, image_client=client)
-        ctx.embedding_client = embed_client
-        ctx.cache_manager = cache_manager
+        ctx = make_context(assets=assets, image_client=client, embedding_client=embed_client, cache_manager=cache_manager)
         node = AnalyzeEmbedding({})
         result = await node.run(ctx)
         # a1 from cache, a2 computed

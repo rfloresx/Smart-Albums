@@ -199,15 +199,17 @@ def _summarise(contexts: ContextBatch) -> str:
 
 def _notify_pipeline_start(contexts: ContextBatch, total_stages: int) -> None:
     """Notify the progress reporter that a pipeline is starting."""
-    for ctx in contexts:
-        if ctx.progress and hasattr(ctx.progress, "start_pipeline"):
-            ctx.progress.start_pipeline(total_stages)
-        break  # Only need to notify once (all contexts share the same reporter)
+    from smart_albums.core.protocols import IProgressReporter, ProtocolsRegistry
+
+    progress = ProtocolsRegistry.get_instance(IProgressReporter)
+    if progress and hasattr(progress, "start_pipeline"):
+        progress.start_pipeline(total_stages)
 
 
 def _notify_stage_enter(contexts: ContextBatch, stage_index: int, name: str) -> None:
     """Notify the progress reporter that a stage is being entered."""
-    for ctx in contexts:
-        if ctx.progress and hasattr(ctx.progress, "set_stage_index"):
-            ctx.progress.set_stage_index(stage_index, name)
-        break
+    from smart_albums.core.protocols import IProgressReporter, ProtocolsRegistry
+
+    progress = ProtocolsRegistry.get_instance(IProgressReporter)
+    if progress and hasattr(progress, "set_stage_index"):
+        progress.set_stage_index(stage_index, name)

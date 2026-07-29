@@ -6,6 +6,7 @@ from datetime import datetime
 
 from smart_albums.core.context import PipelineContext, ContextBatch
 from smart_albums.core.node import Stage, ConfigParam
+from smart_albums.core.protocols import IImageClient, IProgressReporter, ProtocolsRegistry
 from smart_albums.core.registry import stage
 
 
@@ -22,22 +23,25 @@ class RetrieveByYear(Stage):
         after = datetime(year, 1, 1, 0, 0, 0)
         before = datetime(year, 12, 31, 23, 59, 59)
 
-        if ctx.progress:
-            ctx.progress.start_stage(f"Retrieving assets for {year}")
+        progress = ProtocolsRegistry.get_instance(IProgressReporter)
+        image_client = ProtocolsRegistry.get_instance(IImageClient)
 
-        if ctx.image_client is None:
+        if progress:
+            progress.start_stage(f"Retrieving assets for {year}")
+
+        if image_client is None:
             raise RuntimeError("image_client is required for stage 'retrieve.by_year'")
-        fetched = await ctx.image_client.search_assets(after, before)
+        fetched = await image_client.search_assets(after, before)
 
         for _ in fetched:
-            if ctx.progress:
-                ctx.progress.advance()
+            if progress:
+                progress.advance()
 
         ctx.assets.extend(fetched)
         ctx.stats["retrieve.by_year.total_retrieved"] = len(fetched)
 
-        if ctx.progress:
-            ctx.progress.finish_stage()
-            ctx.progress.log(f"Retrieved {len(fetched)} assets for {year}.")
+        if progress:
+            progress.finish_stage()
+            progress.log(f"Retrieved {len(fetched)} assets for {year}.")
 
         return [ctx]

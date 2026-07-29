@@ -1,7 +1,7 @@
 """Helper for splitting a PipelineContext into multiple child contexts.
 
 Used by all partition.* stages to create isolated child contexts — one per
-partition — while sharing expensive client objects and configuration.
+partition — while sharing configuration.
 """
 
 from __future__ import annotations
@@ -20,10 +20,8 @@ def split_contexts(
 ) -> list[PipelineContext]:
     """Split a PipelineContext into multiple contexts, one per partition.
 
-    Creates a new child PipelineContext for each partition. Client objects
-    (image_client, llm_client, embedding_client, progress) are shared across
-    children — only the assets list is deep-copied to ensure mutation isolation.
-    Stats are reset to an empty dict on each child.
+    Creates a new child PipelineContext for each partition. Only the assets list is deep-copied
+    to ensure mutation isolation. Stats are reset to an empty dict on each child.
 
     Args:
         ctx: The parent context to split.
@@ -53,11 +51,6 @@ def split_contexts(
 
         child = PipelineContext(
             config=ctx.config,
-            image_client=ctx.image_client,
-            llm_client=ctx.llm_client,
-            embedding_client=ctx.embedding_client,
-            progress=ctx.progress,
-            cache_manager=ctx.cache_manager,
             assets=copy.deepcopy(assets),
             stats={},
             partition_name=partition_name,

@@ -6,6 +6,7 @@ from datetime import date
 
 from smart_albums.core.context import PipelineContext, ContextBatch
 from smart_albums.core.node import Stage, ConfigParam
+from smart_albums.core.protocols import IImageClient, ProtocolsRegistry
 from smart_albums.core.registry import stage
 from smart_albums.nodes.filter._empty_pool import handle_empty_pool, handle_empty_pool_config
 
@@ -25,9 +26,10 @@ class FilterOnThisDay(Stage):
         photo_count = self.get("photo_count")
 
         pre_filter = list(ctx.assets)
-        if ctx.image_client is None:
+        image_client = ProtocolsRegistry.get_instance(IImageClient)
+        if image_client is None:
             raise RuntimeError("image_client is required for stage 'filter.on_this_day'")
-        fetched = await ctx.image_client.search_on_this_day(run_date)
+        fetched = await image_client.search_on_this_day(run_date)
 
         in_context = {a.id for a in pre_filter}
         candidates = [a for a in fetched if a.id in in_context]

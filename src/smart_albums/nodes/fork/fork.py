@@ -30,21 +30,14 @@ class Branch:
 
 
 def _clone_contexts(contexts: ContextBatch) -> ContextBatch:
-    """Create isolated copies of contexts, sharing client objects.
+    """Create isolated copies of contexts for branch execution.
 
     Deep-copies assets, stats, and metadata for mutation isolation.
-    Client references (image_client, llm_client, etc.) are shared since
-    they hold unpicklable async resources.
     """
     clones: ContextBatch = []
     for ctx in contexts:
         clones.append(PipelineContext(
             config=ctx.config,
-            image_client=ctx.image_client,
-            llm_client=ctx.llm_client,
-            embedding_client=ctx.embedding_client,
-            progress=ctx.progress,
-            cache_manager=ctx.cache_manager,
             assets=copy.deepcopy(ctx.assets),
             stats=dict(ctx.stats),
             metadata=dict(ctx.metadata),

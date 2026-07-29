@@ -20,6 +20,7 @@ from PIL import Image
 
 from smart_albums.core.context import PipelineContext, ContextBatch
 from smart_albums.core.node import Stage, ConfigParam
+from smart_albums.core.protocols import ICacheManager, IImageClient, IProgressReporter, ProtocolsRegistry
 from smart_albums.core.registry import stage
 
 logger = logging.getLogger(__name__)
@@ -71,12 +72,16 @@ class AnalyzePHash(Stage):
 
         concurrency: int = self.get("concurrency")
 
+        cache_manager = ProtocolsRegistry.get_instance(ICacheManager)
         cache = None
-        if ctx.cache_manager:
-            cache = ctx.cache_manager.get_cache(self.name)
+        if cache_manager:
+            cache = cache_manager.get_cache(self.name)
 
-        if ctx.progress:
-            ctx.progress.start_stage("Computing pHash", total=len(ctx.assets))
+        progress = ProtocolsRegistry.get_instance(IProgressReporter)
+        if progress:
+            progress.start_stage("Computing pHash", total=len(ctx.assets))
+
+        image_client = ProtocolsRegistry.get_instance(IImageClient)
 
         semaphore = asyncio.Semaphore(concurrency)
         computed = 0
@@ -92,8 +97,8 @@ class AnalyzePHash(Stage):
             if asset.metadata.get("phash"):
                 async with lock:
                     skipped += 1
-                if ctx.progress:
-                    ctx.progress.advance()
+                if progress:
+                    progress.advance()
                 return
 
             async with semaphore:
@@ -105,14 +110,14 @@ class AnalyzePHash(Stage):
                         asset.metadata["phash"] = hit
                         async with lock:
                             cached_count += 1
-                        if ctx.progress:
-                            ctx.progress.advance()
+                        if progress:
+                            progress.advance()
                         return
 
                 try:
-                    if ctx.image_client is None:
+                    if image_client is None:
                         raise RuntimeError("image_client is required for stage 'analyze.phash'")
-                    thumbnail = await ctx.image_client.get_asset_thumbnail(asset.id)
+                    thumbnail = await image_client.get_asset_thumbnail(asset.id)
                     phash = _compute_phash(thumbnail)
                     asset.metadata["phash"] = phash
 
@@ -130,13 +135,13 @@ class AnalyzePHash(Stage):
                     async with lock:
                         failures += 1
 
-            if ctx.progress:
-                ctx.progress.advance()
+            if progress:
+                progress.advance()
 
         await asyncio.gather(*[_process_one(a) for a in ctx.assets])
 
-        if ctx.progress:
-            ctx.progress.finish_stage()
+        if progress:
+            progress.finish_stage()
 
         ctx.stats["analyze.phash.total_assets"] = len(ctx.assets)
         ctx.stats["analyze.phash.computed"] = computed
