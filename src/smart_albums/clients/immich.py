@@ -491,3 +491,33 @@ class ImmichClient:
             raise
         except ServiceException:
             raise
+
+    @_retry_policy
+    async def get_asset_full(self, asset_id: str) -> bytes:
+        """Return the full-resolution original image bytes for the given asset.
+
+        Args:
+            asset_id: The asset UUID string.
+
+        Returns:
+            Raw image bytes at original resolution.
+
+        Raises:
+            FileNotFoundError: If the asset media file does not exist on the
+                server (HTTP 404).
+            ConnectionError: On transient network errors after retries exhausted.
+        """
+        try:
+            result = await self._get_client().assets.view_asset(
+                id=UUID(asset_id),
+                size=AssetMediaSize.ORIGINAL,
+            )
+            return bytes(result)
+        except NotFoundException:
+            raise FileNotFoundError(
+                f"Asset media not found on server (asset_id={asset_id})"
+            )
+        except (UnauthorizedException, ForbiddenException):
+            raise
+        except ServiceException:
+            raise

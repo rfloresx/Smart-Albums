@@ -59,6 +59,8 @@ class IImageClient(Protocol):
 
     async def remove_assets_from_album(self, album_id: str, asset_ids: list[str]) -> None: ...
 
+    async def get_asset_full(self, asset_id: str) -> bytes: ...
+
 
 @runtime_checkable
 class ILLMClient(Protocol):
