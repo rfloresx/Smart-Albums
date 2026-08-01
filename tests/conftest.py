@@ -7,17 +7,15 @@ from typing import Any
 
 import pytest
 
-from smart_albums.core.models import Asset
+from smart_albums.core.models import AlbumResult, AlbumSummary, Asset
 from smart_albums.core.context import PipelineContext
+from smart_albums.core.protocol_registry import ProtocolsRegistry
 from smart_albums.core.protocols import (
-    AlbumResult,
-    AlbumSummary,
     ICacheManager,
     IEmbeddingClient,
     IImageClient,
     ILLMClient,
     IProgressReporter,
-    ProtocolsRegistry,
 )
 
 
@@ -171,9 +169,6 @@ class FakeLLMClient:
 
     async def analyze_image(self, image_bytes: bytes, prompt: str, return_schema: dict[str, Any]) -> dict[str, Any]:
         return self._response
-
-    async def embed(self, image_bytes: bytes) -> list[float]:
-        return [0.1] * 128
 
 
 class FakeEmbeddingClient:

@@ -26,7 +26,8 @@ from tenacity import (
     wait_exponential,
 )
 
-from smart_albums.core.protocols import IEmbeddingClient, IHealthCheck, ProtocolsRegistry
+from smart_albums.core.protocol_registry import ProtocolsRegistry
+from smart_albums.core.protocols import IEmbeddingClient, IHealthCheck
 
 logger = logging.getLogger(__name__)
 

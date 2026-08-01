@@ -21,16 +21,6 @@ from webgui.auth import get_current_username
 
 logger = logging.getLogger(__name__)
 
-# Protocols to check — skips cachemanager (local, always "up").
-_STATUS_SLOTS = ("image", "llm", "embedding")
-
-# Labels for the status dropdown
-_SLOT_LABELS = {
-    "image": "Image",
-    "llm": "LLM",
-    "embedding": "Embedding",
-}
-
 
 def build_navbar() -> None:
     """Render the application-wide navigation bar.
@@ -153,7 +143,7 @@ def _update_indicator(
         btn: The status button element.
         container: The column inside the dropdown menu.
         results: Dict of slot_name -> (connected, provider_name, message).
-            connected is True/False/None (None = not configured).
+            connected is True/False/None (None = not configured or no health check).
     """
     # Determine summary state
     statuses = [v[0] for v in results.values()]
@@ -185,11 +175,12 @@ def _update_indicator(
     container.clear()
     with container:
         ui.label("Provider Status").classes("text-caption text-weight-bold q-mb-xs")
-        for slot_name in _STATUS_SLOTS:
-            connected, provider_name, message = results.get(
-                slot_name, (None, "", "Unknown")
+        if not results:
+            ui.label("No health-checkable providers configured").classes(
+                "text-caption text-grey"
             )
-            label = _SLOT_LABELS.get(slot_name, slot_name)
+        for slot_name, (connected, provider_name, message) in results.items():
+            label = _get_slot_label(slot_name)
             _render_status_row(label, provider_name, connected, message)
 
 
@@ -218,8 +209,21 @@ def _render_status_row(
         ui.label(status_text).classes("text-caption text-grey")
 
 
+def _get_slot_label(slot_name: str) -> str:
+    """Get the human-friendly label for a slot by looking it up dynamically."""
+    from webgui.services import providers as providers_service
+
+    for slot in providers_service.PROTOCOL_SLOTS:
+        if slot.name == slot_name:
+            return slot.label
+    return slot_name.title()
+
+
 async def _check_all_providers() -> dict[str, tuple[bool | None, str, str]]:
-    """Check health of all configured provider slots.
+    """Check health of all configured provider slots that support IHealthCheck.
+
+    Dynamically discovers which slots have a selected provider that implements
+    IHealthCheck, and runs health checks only for those.
 
     Returns:
         Dict mapping slot name to (connected, provider_name, message).
@@ -230,19 +234,17 @@ async def _check_all_providers() -> dict[str, tuple[bool | None, str, str]]:
 
     results: dict[str, tuple[bool | None, str, str]] = {}
 
-    for slot_name in _STATUS_SLOTS:
-        prov_cfg = state.config.get_provider(slot_name)
+    for slot in providers_service.PROTOCOL_SLOTS:
+        prov_cfg = state.config.get_provider(slot.name)
         if not prov_cfg.selected:
-            results[slot_name] = (None, "", "Not configured")
             continue
 
-        # Find the matching slot object
-        slot = next(
-            (s for s in providers_service.PROTOCOL_SLOTS if s.name == slot_name),
-            None,
+        # Check if the selected provider supports health check
+        provider_specs = providers_service.get_providers_for(slot)
+        provider_spec = next(
+            (p for p in provider_specs if p.name == prov_cfg.selected), None
         )
-        if slot is None:
-            results[slot_name] = (None, "", "Unknown slot")
+        if provider_spec is None or not provider_spec.supports_health_check:
             continue
 
         try:
@@ -252,10 +254,10 @@ async def _check_all_providers() -> dict[str, tuple[bool | None, str, str]]:
                 ),
                 timeout=12.0,
             )
-            results[slot_name] = (ok, prov_cfg.selected, message)
+            results[slot.name] = (ok, prov_cfg.selected, message)
         except asyncio.TimeoutError:
-            results[slot_name] = (False, prov_cfg.selected, "Timed out")
+            results[slot.name] = (False, prov_cfg.selected, "Timed out")
         except Exception as exc:  # noqa: BLE001
-            results[slot_name] = (False, prov_cfg.selected, str(exc))
+            results[slot.name] = (False, prov_cfg.selected, str(exc))
 
     return results

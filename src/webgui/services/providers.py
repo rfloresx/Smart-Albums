@@ -28,13 +28,16 @@ from typing import Any
 from smart_albums.cli.imports import import_clients
 from smart_albums.core.builder import get_init_schema
 from smart_albums.core.node import ConfigParam
+from smart_albums.core.protocol_registry import ProtocolsRegistry
 from smart_albums.core.protocols import (
+    ICache,
     ICacheManager,
     IEmbeddingClient,
+    IGeoClient,
     IHealthCheck,
     IImageClient,
     ILLMClient,
-    ProtocolsRegistry,
+    IProgressReporter,
 )
 
 from webgui.config import ProviderConfig
@@ -53,11 +56,14 @@ class ProtocolSlot:
     """A configurable protocol slot resolved by the pipeline at runtime.
 
     Attributes:
-        name: The config key under ``providers`` (e.g. ``"image"``). Matches
-            the CLI protocol-name derivation.
+        name: The config key under ``providers`` (e.g. ``"image"``). Derived
+            from the protocol class name by stripping the ``I`` prefix and
+            ``Client`` suffix, then lowercasing.
         protocol: The protocol type used to look providers up in the registry.
-        label: Human-friendly title shown in the admin UI.
-        description: One-line explanation of the slot's role.
+        label: Human-friendly title shown in the admin UI. Parsed from the
+            protocol docstring before the colon.
+        description: One-line explanation of the slot's role. Parsed from the
+            protocol docstring after the colon.
     """
 
     name: str
@@ -66,43 +72,117 @@ class ProtocolSlot:
     description: str
 
 
-# Ordered for display. Only slots that map to real pipeline configuration are
-# exposed — cross-cutting protocols like IHealthCheck are intentionally omitted.
-PROTOCOL_SLOTS: list[ProtocolSlot] = [
-    ProtocolSlot(
-        name="image",
-        protocol=IImageClient,
-        label="Image Library",
-        description=(
-            "Photo library provider — the source of assets and the target for "
-            "album publishing."
-        ),
-    ),
-    ProtocolSlot(
-        name="llm",
-        protocol=ILLMClient,
-        label="Vision / LLM",
-        description="Vision model backend used for aesthetic quality scoring.",
-    ),
-    ProtocolSlot(
-        name="embedding",
-        protocol=IEmbeddingClient,
-        label="Embedding",
-        description=(
-            "Backend that computes image embeddings for scene clustering and "
-            "near-duplicate detection."
-        ),
-    ),
-    ProtocolSlot(
-        name="cachemanager",
-        protocol=ICacheManager,
-        label="Cache",
-        description=(
-            "Local cache for scores and embeddings so re-runs skip "
-            "already-computed assets."
-        ),
-    ),
-]
+# Cross-cutting protocols that should NOT appear as configurable provider
+# slots in the UI — they are infrastructure/internal concerns.
+_EXCLUDED_PROTOCOLS: set[type] = {IHealthCheck, IProgressReporter, ICache}
+
+
+def _derive_slot_name(protocol_cls: type) -> str:
+    """Derive the slot name from a protocol class name.
+
+    Rules:
+    - Remove leading ``I`` prefix.
+    - Remove trailing ``Client`` suffix.
+    - Lowercase the result.
+
+    Examples:
+        IImageClient -> image
+        ILLMClient -> llm
+        IEmbeddingClient -> embedding
+        ICacheManager -> cachemanager
+        IGeoClient -> geo
+    """
+    name = protocol_cls.__name__
+    # Strip leading 'I'
+    if name.startswith("I") and len(name) > 1 and name[1].isupper():
+        name = name[1:]
+    # Strip trailing 'Client'
+    if name.endswith("Client"):
+        name = name[: -len("Client")]
+    return name.lower()
+
+
+def _parse_protocol_doc(protocol_cls: type) -> tuple[str, str]:
+    """Parse label and description from protocol docstring.
+
+    Expected format: ``\"\"\"Label:Description\"\"\"``
+
+    Falls back to the class name as label and empty description if the
+    docstring doesn't follow the convention.
+    """
+    doc = protocol_cls.__doc__ or ""
+    # Take only the first line of the docstring
+    first_line = doc.strip().split("\n")[0].strip()
+
+    if ":" in first_line:
+        label, _, description = first_line.partition(":")
+        return label.strip(), description.strip()
+
+    # Fallback: use class name as label
+    return _derive_slot_name(protocol_cls).title(), first_line
+
+
+def _build_protocol_slots() -> list[ProtocolSlot]:
+    """Dynamically discover configurable protocol slots from the registry.
+
+    Iterates all protocols registered in ProtocolsRegistry, excludes
+    cross-cutting ones (IHealthCheck, IProgressReporter, ICache), and
+    builds ProtocolSlot instances using docstring metadata.
+    """
+    _ensure_registered()
+
+    slots: list[ProtocolSlot] = []
+    for protocol_cls in ProtocolsRegistry.get_protocols():
+        if protocol_cls in _EXCLUDED_PROTOCOLS:
+            continue
+
+        name = _derive_slot_name(protocol_cls)
+        label, description = _parse_protocol_doc(protocol_cls)
+        slots.append(
+            ProtocolSlot(
+                name=name,
+                protocol=protocol_cls,
+                label=label,
+                description=description,
+            )
+        )
+
+    # Sort alphabetically by name for stable ordering
+    slots.sort(key=lambda s: s.name)
+    return slots
+
+
+def get_protocol_slots() -> list[ProtocolSlot]:
+    """Return the list of configurable protocol slots.
+
+    Dynamically discovers slots from the ProtocolsRegistry on first call,
+    then caches the result for subsequent calls.
+    """
+    global _protocol_slots_cache
+    if _protocol_slots_cache is None:
+        _protocol_slots_cache = _build_protocol_slots()
+    return _protocol_slots_cache
+
+
+_protocol_slots_cache: list[ProtocolSlot] | None = None
+
+
+# Backward-compatible alias — consumers can still import PROTOCOL_SLOTS,
+# but it now delegates to dynamic discovery.
+class _ProtocolSlotsProxy:
+    """Lazy proxy that behaves like a list but builds slots on first access."""
+
+    def __iter__(self):
+        return iter(get_protocol_slots())
+
+    def __len__(self):
+        return len(get_protocol_slots())
+
+    def __getitem__(self, index):
+        return get_protocol_slots()[index]
+
+
+PROTOCOL_SLOTS = _ProtocolSlotsProxy()
 
 
 # ---------------------------------------------------------------------------

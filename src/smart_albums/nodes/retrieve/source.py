@@ -10,7 +10,8 @@ from datetime import date
 
 from smart_albums.core.context import PipelineContext, ContextBatch
 from smart_albums.core.node import Stage, ConfigParam
-from smart_albums.core.protocols import IImageClient, ProtocolsRegistry
+from smart_albums.core.protocol_registry import ProtocolsRegistry
+from smart_albums.core.protocols import IImageClient
 from smart_albums.core.registry import stage
 from smart_albums.nodes.retrieve._sources import build_source
 

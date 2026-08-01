@@ -20,7 +20,8 @@ from PIL import Image
 
 from smart_albums.core.context import PipelineContext, ContextBatch
 from smart_albums.core.node import Stage, ConfigParam
-from smart_albums.core.protocols import ICacheManager, IImageClient, IProgressReporter, ProtocolsRegistry
+from smart_albums.core.protocol_registry import ProtocolsRegistry
+from smart_albums.core.protocols import ICacheManager, IImageClient, IProgressReporter
 from smart_albums.core.registry import stage
 
 logger = logging.getLogger(__name__)

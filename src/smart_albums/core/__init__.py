@@ -4,12 +4,10 @@ from __future__ import annotations
 
 from smart_albums.core.builder import build_pipeline, build_alias_map, resolve_overrides
 from smart_albums.core.context import PipelineContext, ContextBatch
-from smart_albums.core.models import Asset
+from smart_albums.core.models import AlbumResult, AlbumSummary, Asset
 from smart_albums.core.node import ConfigParam, PipelineNode, Stage
 
 from smart_albums.core.protocols import (
-    AlbumResult,
-    AlbumSummary,
     IImageClient,
     ILLMClient,
     IProgressReporter,

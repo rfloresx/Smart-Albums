@@ -18,11 +18,11 @@ from typing import Any
 from smart_albums.core.context import ContextBatch, PipelineContext
 from smart_albums.core.models import Asset
 from smart_albums.core.node import ConfigParam, Stage
+from smart_albums.core.models import PlaceCandidate
+from smart_albums.core.protocol_registry import ProtocolsRegistry
 from smart_albums.core.protocols import (
     ICacheManager,
     IGeoClient,
-    PlaceCandidate,
-    ProtocolsRegistry,
 )
 from smart_albums.core.registry import stage
 

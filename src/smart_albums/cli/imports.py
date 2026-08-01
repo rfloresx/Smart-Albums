@@ -37,3 +37,4 @@ def import_clients() -> None:
     """Import client modules to trigger ProtocolsRegistry registration."""
     import smart_albums.clients  # noqa: F401
     import smart_albums.core.cache  # noqa: F401
+    import smart_albums.core.no_cache  # noqa: F401

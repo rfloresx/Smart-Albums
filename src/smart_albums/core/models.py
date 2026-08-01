@@ -26,3 +26,35 @@ class Asset:
     metadata: dict[str, Any] = field(default_factory=dict)
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class AlbumSummary:
+    """Summary of an existing album."""
+
+    id: str
+    name: str
+
+
+@dataclass(frozen=True)
+class AlbumResult:
+    """Result of creating or updating an album."""
+
+    id: str
+    name: str
+    url: str
+
+
+@dataclass(frozen=True)
+class PlaceCandidate:
+    """A single reverse-geocoded place result."""
+
+    name: str
+    city: str
+    state: str
+    country: str
+    latitude: float
+    longitude: float
+    distance_meters: float
+    place_type: str = ""
+    raw: dict[str, Any] = field(default_factory=dict)

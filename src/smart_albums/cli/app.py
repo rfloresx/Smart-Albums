@@ -24,7 +24,7 @@ from smart_albums.cli.config import configure_logging, load_json_file
 from smart_albums.cli.execution import execute_pipeline
 from smart_albums.cli.imports import import_all_stages, import_clients
 from smart_albums.core.node import ConfigParam
-from smart_albums.core.protocols import ProtocolsRegistry
+from smart_albums.core.protocol_registry import ProtocolsRegistry
 import smart_albums.core.builder as builder
 
 app = typer.Typer(

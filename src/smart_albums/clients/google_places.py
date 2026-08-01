@@ -22,11 +22,11 @@ import re
 import time
 from typing import Any
 
+from smart_albums.core.models import PlaceCandidate
+from smart_albums.core.protocol_registry import ProtocolsRegistry
 from smart_albums.core.protocols import (
     IGeoClient,
     IHealthCheck,
-    PlaceCandidate,
-    ProtocolsRegistry,
 )
 
 logger = logging.getLogger(__name__)

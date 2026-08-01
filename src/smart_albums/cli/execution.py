@@ -9,7 +9,7 @@ from typing import Any, Optional
 from rich.console import Console
 from rich.table import Table
 
-from smart_albums.core.protocols import ProtocolsRegistry
+from smart_albums.core.protocol_registry import ProtocolsRegistry
 
 logger = logging.getLogger(__name__)
 console = Console()

@@ -2,35 +2,31 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from datetime import date, datetime
-from typing import Any, Protocol, TypeVar, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
-from smart_albums.core.models import Asset
+from smart_albums.core.models import AlbumResult, AlbumSummary, Asset, PlaceCandidate
+from smart_albums.core.protocol_registry import ProtocolsRegistry
 
-T = TypeVar("T")
-
-
-@dataclass(frozen=True)
-class AlbumSummary:
-    """Summary of an existing album."""
-
-    id: str
-    name: str
-
-
-@dataclass(frozen=True)
-class AlbumResult:
-    """Result of creating or updating an album."""
-
-    id: str
-    name: str
-    url: str
+__all__ = [
+    "AlbumResult",
+    "AlbumSummary",
+    "PlaceCandidate",
+    "ProtocolsRegistry",
+    "ICache",
+    "ICacheManager",
+    "IEmbeddingClient",
+    "IGeoClient",
+    "IHealthCheck",
+    "IImageClient",
+    "ILLMClient",
+    "IProgressReporter",
+]
 
 
 @runtime_checkable
 class IImageClient(Protocol):
-    """Abstraction over any photo library provider."""
+    """Image Library:Photo library provider — the source of assets and the target for album publishing."""
 
     async def search_assets(
         self,
@@ -64,30 +60,15 @@ class IImageClient(Protocol):
 
 @runtime_checkable
 class ILLMClient(Protocol):
-    """Abstraction over vision/LLM backends."""
+    """Vision / LLM:Vision model backend used for aesthetic quality scoring."""
 
     async def analyze_image(self, image_bytes: bytes, prompt: str, return_schema: dict[str, Any]) -> dict[str, Any]: ...
-
-    async def embed(self, image_bytes: bytes) -> list[float]: ...
 
 
 @runtime_checkable
 class IEmbeddingClient(Protocol):
-    """Abstraction over embedding-only backends (e.g. Ollama, HuggingFace).
+    """Embedding:Backend that computes image embeddings for scene clustering and near-duplicate detection."""
 
-    Unlike ILLMClient which combines vision analysis with embedding,
-    this protocol is purpose-specific for computing vector embeddings
-    from raw image bytes. The caller is responsible for lifecycle
-    management via the optional close() method.
-
-    Batch API
-    ---------
-    Clients that can process multiple images in a single forward pass
-    (e.g. GPU-backed HuggingFace models) should also implement
-    ``embed_batch()``. The node layer detects support via
-    ``hasattr(client, 'embed_batch')`` and prefers the batch path when
-    available, falling back to sequential ``embed()`` calls otherwise.
-    """
     @property
     def embed_model(self) -> str: ...
 
@@ -139,28 +120,9 @@ class IHealthCheck(Protocol):
         ...
 
 
-@dataclass(frozen=True)
-class PlaceCandidate:
-    """A single reverse-geocoded place result."""
-
-    name: str
-    city: str
-    state: str
-    country: str
-    latitude: float
-    longitude: float
-    distance_meters: float
-    place_type: str = ""
-    raw: dict[str, Any] = field(default_factory=dict)
-
-
 @runtime_checkable
 class IGeoClient(Protocol):
-    """Abstraction over reverse geocoding providers.
-
-    Implementations resolve GPS coordinates into a ranked list of nearby
-    place candidates, enabling human review of the best match.
-    """
+    """Geolocation:Reverse geocoding provider that resolves GPS coordinates into place name candidates."""
 
     async def reverse_geocode(
         self,
@@ -181,70 +143,9 @@ class ICache(Protocol):
 
     def __len__(self) -> int: ...
 
+
 @runtime_checkable
 class ICacheManager(Protocol):
+    """Cache:Local cache for scores and embeddings so re-runs skip already-computed assets."""
+
     def get_cache(self, cache_name: str) -> ICache | None: ...
-
-
-class ProtocolsRegistry:
-    _registry: dict[type, dict[str, type]] = {}
-    _instances: dict[type, Any] = {}
-
-    @staticmethod
-    def register(name: str, protocol: type) -> Any:
-        def decorator(cls: type) -> type:
-            if protocol not in ProtocolsRegistry._registry:
-                ProtocolsRegistry._registry[protocol] = {}
-            ProtocolsRegistry._registry[protocol][name] = cls
-            return cls
-        return decorator
-
-    @staticmethod
-    def get_registry() -> dict[type, dict[str, type]]:
-        return ProtocolsRegistry._registry
-
-    @staticmethod
-    def get_protocols() -> list[type]:
-        return list(ProtocolsRegistry._registry.keys())
-
-    @staticmethod
-    def get_providers(protocol: type) -> dict[str, type]:
-        return ProtocolsRegistry._registry.get(protocol, {})
-
-    @staticmethod
-    def create(protocol: type, name: str, config: dict[str, Any]) -> Any:
-        """Create an instance and store it in the internal instances map."""
-        if protocol not in ProtocolsRegistry._registry:
-            raise ValueError(f"No clients registered for protocol {protocol}")
-        if name not in ProtocolsRegistry._registry[protocol]:
-            raise ValueError(f"No client named {name} registered for protocol {protocol}")
-        instance = ProtocolsRegistry._registry[protocol][name](**config)
-        ProtocolsRegistry._instances[protocol] = instance
-        return instance
-
-    @staticmethod
-    def get_instance(protocol: type[T]) -> T | None:
-        """Return the live instance for a protocol, or None if not created."""
-        return ProtocolsRegistry._instances.get(protocol)
-
-    @staticmethod
-    def set_instance(protocol: type, instance: Any) -> None:
-        """Manually register a pre-built instance (useful for testing / webgui)."""
-        ProtocolsRegistry._instances[protocol] = instance
-
-    @staticmethod
-    def clear_instances() -> None:
-        """Remove all live instances. Called between pipeline runs or in tests."""
-        ProtocolsRegistry._instances.clear()
-
-@ProtocolsRegistry.register("disabled", ICacheManager)
-class NoCacheManager:
-    """No-op cache manager that always returns None from the factory.
-
-    Registered as the "disabled" provider so that pipeline execution can
-    proceed without caching when no cache_dir is configured.
-    """
-
-    def get_cache(self, cache_name: str) -> None:
-        """Return None — signals to stages that caching is disabled."""
-        return None
