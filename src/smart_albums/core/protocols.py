@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Protocol, TypeVar, runtime_checkable
 
@@ -135,6 +135,38 @@ class IHealthCheck(Protocol):
     def health_check_url(self) -> str:
         """The base URL being checked, for display purposes."""
         ...
+
+
+@dataclass(frozen=True)
+class PlaceCandidate:
+    """A single reverse-geocoded place result."""
+
+    name: str
+    city: str
+    state: str
+    country: str
+    latitude: float
+    longitude: float
+    distance_meters: float
+    place_type: str = ""
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+@runtime_checkable
+class IGeoClient(Protocol):
+    """Abstraction over reverse geocoding providers.
+
+    Implementations resolve GPS coordinates into a ranked list of nearby
+    place candidates, enabling human review of the best match.
+    """
+
+    async def reverse_geocode(
+        self,
+        latitude: float,
+        longitude: float,
+        radius_meters: int = 1000,
+        max_results: int = 10,
+    ) -> list[PlaceCandidate]: ...
 
 
 @runtime_checkable

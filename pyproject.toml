@@ -43,6 +43,9 @@ huggingface = [
     "transformers>=4.38.0,<5",
     "torch>=2.0.0",
 ]
+geo = [
+    "googlemaps>=4.10.0,<5",
+]
 openai = [
     "openai>=1.0.0,<3",
 ]
@@ -89,6 +92,7 @@ module = [
     "aiosqlite.*",
     "bcrypt.*",
     "yaml.*",
+    "googlemaps.*",
 ]
 ignore_missing_imports = true
 ignore_errors = true

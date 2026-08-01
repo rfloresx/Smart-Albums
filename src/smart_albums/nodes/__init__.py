@@ -11,6 +11,7 @@ from __future__ import annotations
 from smart_albums.nodes import (  # noqa: F401
     analyze,
     dedup,
+    enrich,
     filter,
     fork,
     merge,
