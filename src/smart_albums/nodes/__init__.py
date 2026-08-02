@@ -12,6 +12,7 @@ from smart_albums.nodes import (  # noqa: F401
     analyze,
     dedup,
     enrich,
+    export,
     filter,
     fork,
     merge,
