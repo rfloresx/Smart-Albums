@@ -48,6 +48,7 @@ class AppConfig(BaseModel):
     auth: AuthConfig = AuthConfig()
     cache_dir: str = "/data/cache"
     prompts_dir: str = "/data/prompts"
+    exports_dir: str = "/data/exports"
     db_path: str = "/data/db/smart_albums.db"
     log_file: Optional[str] = None
 
@@ -150,6 +151,7 @@ def load_config(config_path: Optional[str] = None) -> AppConfig:
 
     cfg.cache_dir = _resolve_data_dir(cfg.cache_dir, "cache")
     cfg.prompts_dir = _resolve_data_dir(cfg.prompts_dir, "prompts")
+    cfg.exports_dir = _resolve_data_dir(cfg.exports_dir, "exports")
     cfg.db_path = _resolve_db_path(cfg.db_path)
 
     resolve_provider_paths(cfg)

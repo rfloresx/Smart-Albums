@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import os
+import shutil
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -32,6 +33,7 @@ logger = logging.getLogger(__name__)
 PROGRESS_PREFIX = "@@PROGRESS@@"
 _CONFIG_DIR = Path("/tmp/smart-albums-jobs")
 _PROMPT_DIR = _CONFIG_DIR / "prompts"
+_LOGS_DIR = Path("/tmp/smart-albums-jobs/logs")
 
 # Maximum number of pipeline subprocesses that can run concurrently.
 # Additional jobs wait in the queue until a slot becomes available.
@@ -59,6 +61,42 @@ def _write_config_file(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     path.write_text(json.dumps(data, indent=2), encoding="utf-8")
     os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)  # 0600
+
+
+def _pipeline_has_export_context(steps: list[Any]) -> bool:
+    """Check if a pipeline definition contains an export.context stage."""
+    for step in steps:
+        if isinstance(step, (list, tuple)) and len(step) >= 1:
+            stage_name = step[0]
+            if stage_name == "export.context":
+                return True
+    return False
+
+
+def _inject_export_directory(cli_config: dict[str, Any], job_id: str) -> None:
+    """Inject the managed export directory into pipeline_settings for export.context.
+
+    Only modifies the config if the pipeline includes an export.context stage.
+    For user pipelines, checks the embedded steps. For built-in pipelines,
+    checks if the alias already exists in pipeline_settings.
+    """
+    export_dir = str(Path(state.config.exports_dir) / job_id)
+    settings = cli_config.get("pipeline_settings", {})
+
+    # User pipelines: check steps definition
+    pipeline_steps = cli_config.get("pipeline")
+    if pipeline_steps and _pipeline_has_export_context(pipeline_steps):
+        export_cfg = settings.setdefault("export.context", {})
+        export_cfg["export_directory"] = export_dir
+        settings["export.context"] = export_cfg
+        cli_config["pipeline_settings"] = settings
+        return
+
+    # Built-in pipelines: only inject if the alias already exists in settings
+    # (user explicitly configured it) — otherwise the pipeline doesn't have the stage
+    if "export.context" in settings:
+        settings["export.context"]["export_directory"] = export_dir
+        cli_config["pipeline_settings"] = settings
 
 
 def _build_cli_config(pipeline_settings: dict[str, Any], job_id: str) -> dict[str, Any]:
@@ -189,6 +227,8 @@ async def cancel_job(job_id: str) -> None:
 async def delete_job(job_id: str) -> None:
     """Delete a completed or failed job record.
 
+    Also removes any exported data from the managed export directory.
+
     Raises:
         ValueError: If the job is still running or doesn't exist.
     """
@@ -198,6 +238,15 @@ async def delete_job(job_id: str) -> None:
     if record.status == JobStatus.running:
         raise ValueError("Cannot delete a running job")
     await state.db.delete_job(job_id)
+
+    # Clean up export artifacts
+    export_dir = Path(state.config.exports_dir) / job_id
+    if export_dir.is_dir():
+        shutil.rmtree(export_dir, ignore_errors=True)
+
+    # Clean up log file
+    log_file = get_log_file(job_id)
+    log_file.unlink(missing_ok=True)
 
 
 def get_live_job(job_id: str) -> JobRecord | None:
@@ -209,6 +258,30 @@ async def list_jobs() -> list[JobRecord]:
     """List all jobs, overlaying live progress for running ones."""
     jobs = await state.db.list_jobs()
     return [state.running_jobs.get(j.id, j) for j in jobs]
+
+
+def get_export_dir(job_id: str) -> Path:
+    """Return the managed export directory path for a job."""
+    return Path(state.config.exports_dir) / job_id
+
+
+def has_export_output(job_id: str) -> bool:
+    """Check if a job produced downloadable export data."""
+    export_dir = get_export_dir(job_id)
+    try:
+        return export_dir.is_dir() and any(export_dir.iterdir())
+    except OSError:
+        return False
+
+
+def get_log_file(job_id: str) -> Path:
+    """Return the path to the full log file for a job."""
+    return _LOGS_DIR / f"{job_id}.log"
+
+
+def has_log_file(job_id: str) -> bool:
+    """Check if a full log file exists for a job."""
+    return get_log_file(job_id).is_file()
 
 
 async def _run_job(job_id: str) -> None:
@@ -240,7 +313,11 @@ async def _run_job(job_id: str) -> None:
         cli_config = _build_cli_config(record.pipeline_settings, job_id)
 
         _CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _LOGS_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
         config_file = _CONFIG_DIR / f"{job_id}.json"
+        log_file = get_log_file(job_id)
+        # For built-in pipelines, inject export dir if applicable
+        _inject_export_directory(cli_config, job_id)
         _write_config_file(config_file, cli_config)
 
         log_level = record.pipeline_settings.get("_log_level", "INFO")
@@ -262,6 +339,7 @@ async def _run_job(job_id: str) -> None:
                     )
                 # Inject the pipeline steps into the config
                 cli_config["pipeline"] = user_pipeline["steps"]
+                _inject_export_directory(cli_config, job_id)
                 _write_config_file(config_file, cli_config)
 
                 proc = await asyncio.create_subprocess_exec(
@@ -290,23 +368,29 @@ async def _run_job(job_id: str) -> None:
             output_lines: list[str] = []
             _log_update_counter = 0
             assert proc.stdout is not None
-            async for line in proc.stdout:
-                decoded = line.decode("utf-8", errors="replace")
+            with open(log_file, "w", encoding="utf-8") as lf:
+                async for line in proc.stdout:
+                    decoded = line.decode("utf-8", errors="replace")
 
-                if decoded.startswith(PROGRESS_PREFIX):
-                    try:
-                        event = json.loads(decoded[len(PROGRESS_PREFIX):])
-                        _update_progress(record, event)
-                    except (json.JSONDecodeError, KeyError) as exc:
-                        logger.debug("Failed to parse progress event: %s", exc)
-                    continue
+                    if decoded.startswith(PROGRESS_PREFIX):
+                        try:
+                            event = json.loads(decoded[len(PROGRESS_PREFIX):])
+                            _update_progress(record, event)
+                        except (json.JSONDecodeError, KeyError) as exc:
+                            logger.debug("Failed to parse progress event: %s", exc)
+                        continue
 
-                output_lines.append(decoded)
-                if len(output_lines) > 2000:
-                    output_lines = output_lines[-2000:]
-                _log_update_counter += 1
-                if _log_update_counter % 20 == 0:
-                    record.log_output = "".join(output_lines)
+                    # Write full log to file (no truncation)
+                    lf.write(decoded)
+                    lf.flush()
+
+                    # Keep tail in memory for UI display
+                    output_lines.append(decoded)
+                    if len(output_lines) > 2000:
+                        output_lines = output_lines[-2000:]
+                    _log_update_counter += 1
+                    if _log_update_counter % 20 == 0:
+                        record.log_output = "".join(output_lines)
 
             # Final join to capture any remaining lines
             record.log_output = "".join(output_lines)

@@ -11,6 +11,7 @@ services:
       - ./config.yaml:/config/config.yaml:ro
       - smart-albums-cache:/data/cache
       - smart-albums-prompts:/data/prompts
+      - smart-albums-exports:/data/exports
       - smart-albums-db:/data/db
     environment:
       - CONFIG_PATH=/config/config.yaml
@@ -25,4 +26,5 @@ services:
 volumes:
   smart-albums-cache:
   smart-albums-prompts:
+  smart-albums-exports:
   smart-albums-db:

@@ -2,21 +2,29 @@
 
 Shows all jobs (newest first) with live progress for running ones. Each job
 card shows status, timing, and expandable log output. Running jobs can be
-cancelled; completed/failed jobs can be deleted.
+cancelled; completed/failed jobs can be deleted. Completed jobs with export
+data offer a download button.
 """
 
 from __future__ import annotations
 
 import logging
+import zipfile
 from datetime import datetime
+from io import BytesIO
+from pathlib import Path
 
-from nicegui import ui
+from nicegui import app, ui
+from starlette.responses import Response
 
 from webgui.components.navbar import build_navbar
 from webgui.models import JobStatus
 from webgui.services import jobs as jobs_service
 
 logger = logging.getLogger(__name__)
+
+# Maximum total size of export directory allowed for on-the-fly ZIP (500 MB)
+_MAX_EXPORT_ZIP_BYTES = 500 * 1024 * 1024
 
 
 def _status_color(status: JobStatus) -> str:
@@ -45,6 +53,110 @@ def _fmt_time(dt: datetime | None) -> str:
 
 def _build_header() -> None:
     build_navbar()
+
+
+# ---------------------------------------------------------------------------
+# Export download endpoint (FastAPI)
+# ---------------------------------------------------------------------------
+
+
+def _create_export_zip(export_dir: Path) -> bytes:
+    """Create a ZIP archive from the export directory contents."""
+    # Check total size first
+    total_size = sum(f.stat().st_size for f in export_dir.rglob("*") if f.is_file())
+    if total_size > _MAX_EXPORT_ZIP_BYTES:
+        raise ValueError(
+            f"Export too large for download ({total_size // (1024 * 1024)} MB "
+            f"exceeds {_MAX_EXPORT_ZIP_BYTES // (1024 * 1024)} MB limit)"
+        )
+
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for file_path in sorted(export_dir.rglob("*")):
+            if file_path.is_file():
+                arcname = str(file_path.relative_to(export_dir))
+                zf.write(file_path, arcname)
+    return buffer.getvalue()
+
+
+@app.get("/api/jobs/{job_id}/download")
+async def download_export(job_id: str) -> Response:
+    """Download the exported data for a completed job as a ZIP archive."""
+    from webgui.state import state
+
+    record = await state.db.get_job(job_id)
+    if record is None:
+        return Response(content="Job not found", status_code=404)
+    if record.status != JobStatus.completed:
+        return Response(content="Job has not completed yet", status_code=400)
+
+    export_dir = jobs_service.get_export_dir(job_id)
+    if not export_dir.is_dir():
+        return Response(
+            content="Export data not available (pipeline may not include export.context)",
+            status_code=404,
+        )
+
+    # If directory has no files
+    if not any(export_dir.rglob("*")):
+        return Response(content="No files to download", status_code=404)
+
+    # Check if a pre-built ZIP exists in the export directory root
+    existing_zips = list(export_dir.glob("*.zip"))
+    if existing_zips:
+        # Serve the first ZIP found directly
+        zip_path = existing_zips[0]
+        return Response(
+            content=zip_path.read_bytes(),
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f'attachment; filename="{zip_path.name}"'
+            },
+        )
+
+    # Create ZIP on-the-fly
+    try:
+        zip_bytes = _create_export_zip(export_dir)
+    except ValueError as exc:
+        return Response(content=str(exc), status_code=413)
+
+    filename = f"job-{job_id}-export.zip"
+    return Response(
+        content=zip_bytes,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/api/jobs/{job_id}/logs")
+async def download_logs(job_id: str) -> Response:
+    """Download the full log file for a job."""
+    from webgui.state import state
+
+    record = await state.db.get_job(job_id)
+    if record is None:
+        return Response(content="Job not found", status_code=404)
+
+    log_file = jobs_service.get_log_file(job_id)
+    if not log_file.is_file():
+        # Fall back to the in-memory log_output stored in the DB
+        if record.log_output:
+            return Response(
+                content=record.log_output,
+                media_type="text/plain",
+                headers={
+                    "Content-Disposition": f'attachment; filename="job-{job_id}.log"'
+                },
+            )
+        return Response(content="No log data available for this job", status_code=404)
+
+    return Response(
+        content=log_file.read_bytes(),
+        media_type="text/plain",
+        headers={
+            "Content-Disposition": f'attachment; filename="job-{job_id}.log"'
+        },
+    )
 
 
 def _build_job_card(job, *, on_refresh) -> dict:
@@ -149,6 +261,22 @@ def _render_actions(container, job, *, on_refresh) -> None:
                 "Cancel", icon="stop", on_click=do_cancel
             ).props("flat color=negative size=sm")
         elif job.status in (JobStatus.completed, JobStatus.failed):
+            # Download button for completed jobs with export data
+            if job.status == JobStatus.completed and jobs_service.has_export_output(job.id):
+                ui.button(
+                    "Download",
+                    icon="download",
+                    on_click=lambda jid=job.id: ui.download(f"/api/jobs/{jid}/download"),
+                ).props("flat color=primary size=sm")
+
+            # Download full log file
+            if jobs_service.has_log_file(job.id) or job.log_output:
+                ui.button(
+                    "Logs",
+                    icon="article",
+                    on_click=lambda jid=job.id: ui.download(f"/api/jobs/{jid}/logs"),
+                ).props("flat color=secondary size=sm")
+
             async def do_delete(jid=job.id) -> None:
                 try:
                     await jobs_service.delete_job(jid)

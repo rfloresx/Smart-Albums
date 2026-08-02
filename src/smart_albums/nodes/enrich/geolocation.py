@@ -150,7 +150,7 @@ class EnrichGeolocation(Stage):
         skip_existing: bool = self.get("skip_if_exists")
         concurrency: int = self.get("concurrency")
 
-        if cache:
+        if cache is not None:
             logger.debug("Geo cache enabled (precision=%d)", precision)
         else:
             logger.debug("Geo cache disabled — all lookups will hit the API")
@@ -178,7 +178,7 @@ class EnrichGeolocation(Stage):
             key = _cache_key(asset.latitude, asset.longitude, radius, precision)
 
             # Check cache first
-            if cache and key in cache:
+            if cache is not None and key in cache:
                 cached_data = cache.get(key)
                 candidates = [
                     PlaceCandidate(**entry) for entry in cached_data
@@ -196,7 +196,7 @@ class EnrichGeolocation(Stage):
                 api_calls += 1
 
                 # Persist to cache
-                if cache:
+                if cache is not None:
                     cache.put(
                         key,
                         [_serialize_candidate(c) for c in candidates],

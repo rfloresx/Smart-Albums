@@ -110,7 +110,9 @@ async def execute_pipeline(
         if cache_manager is not None and hasattr(cache_manager, "__aenter__"):
             cache_manager = await stack.enter_async_context(cache_manager)  # type: ignore[arg-type]
 
-        # Register context-managed instances in the ProtocolsRegistry
+        # Register context-managed instances in the ProtocolsRegistry.
+        # Some clients are async context managers (their reference may change
+        # after __aenter__), so we clear and re-register all of them.
         from smart_albums.core.protocols import (
             ICacheManager,
             IEmbeddingClient,
@@ -120,6 +122,8 @@ async def execute_pipeline(
         )
 
         ProtocolsRegistry.clear_instances()
+
+        # Re-register the context-managed core clients
         if image_client is not None:
             ProtocolsRegistry.set_instance(IImageClient, image_client)
         if llm_client is not None:
@@ -129,6 +133,15 @@ async def execute_pipeline(
         if cache_manager is not None:
             ProtocolsRegistry.set_instance(ICacheManager, cache_manager)
         ProtocolsRegistry.set_instance(IProgressReporter, progress)
+
+        # Register any remaining protocol clients (e.g. IGeoClient) that
+        # were created but don't require async context management.
+        for protocol, providers in ProtocolsRegistry.get_registry().items():
+            if ProtocolsRegistry.get_instance(protocol) is not None:
+                continue  # Already registered above
+            protocol_name = protocol.__name__.removeprefix("I").removesuffix("Client").lower()
+            if protocol_name in clients:
+                ProtocolsRegistry.set_instance(protocol, clients[protocol_name])
 
         ctx = PipelineContext(
             config={},
