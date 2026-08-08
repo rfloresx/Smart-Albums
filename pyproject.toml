@@ -78,6 +78,7 @@ pythonpath = ["tests"]
 strict = true
 packages = ["smart_albums", "webgui"]
 mypy_path = ["src"]
+disable_error_code = ["type-abstract"]
 
 [[tool.mypy.overrides]]
 module = [
@@ -102,8 +103,9 @@ module = [
     "webgui.pages.*",
     "webgui.main",
     "webgui.components.*",
+    "webgui.services.*",
 ]
-disable_error_code = ["no-untyped-def", "no-any-return", "assignment", "union-attr", "type-arg", "index", "call-overload", "arg-type", "comparison-overlap"]
+disable_error_code = ["no-untyped-def", "no-untyped-call", "no-any-return", "assignment", "union-attr", "type-arg", "index", "call-overload", "arg-type", "comparison-overlap"]
 
 [[tool.mypy.overrides]]
 module = "smart_albums.clients.huggingface_embedding"

@@ -404,7 +404,8 @@ class LocalImageClient:
         if not self._metadata_path.is_file():
             return {}
         try:
-            return json.loads(self._metadata_path.read_text(encoding="utf-8"))
+            data: dict[str, Any] = json.loads(self._metadata_path.read_text(encoding="utf-8"))
+            return data
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("Failed to load metadata.json: %s", exc)
             return {}
