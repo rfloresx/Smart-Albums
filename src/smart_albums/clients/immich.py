@@ -441,13 +441,30 @@ class ImmichClient:
         Raises:
             ConnectionError: On transient network errors after retries exhausted.
         """
-        try:
-            result = await self._get_client().albums.get_album_info(UUID(album_id))
-            return [_map_asset(dto) for dto in result.assets]
-        except (UnauthorizedException, ForbiddenException):
-            raise
-        except ServiceException:
-            raise
+        results: list[Asset] = []
+        page = 1
+
+        while True:
+            dto = MetadataSearchDto(
+                album_ids=[UUID(album_id)],
+                page=page,
+                with_exif=True,
+            )
+            try:
+                response = await self._get_client().search.search_assets(dto)
+            except (UnauthorizedException, ForbiddenException):
+                raise
+            except ServiceException:
+                raise
+
+            for asset_dto in response.assets.items:
+                results.append(_map_asset(asset_dto))
+
+            if response.assets.next_page is None:
+                break
+            page = int(response.assets.next_page)
+
+        return results
 
     @_retry_policy
     async def add_assets_to_album(self, album_id: str, asset_ids: list[str]) -> None:
