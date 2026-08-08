@@ -58,7 +58,7 @@ RUN pip install --no-cache-dir \
 # Install the main package from the wheel with all required extras.
 # torch is already satisfied from above so pip won't re-download it.
 COPY --from=builder /build/dist/*.whl /tmp/
-RUN pip install --no-cache-dir "$(ls /tmp/*.whl)[huggingface,openai,webgui]" \
+RUN pip install --no-cache-dir "$(ls /tmp/*.whl)[geo,huggingface,openai,webgui]" \
     && rm -f /tmp/*.whl
 
 # Copy the webgui package, scripts, and default prompts

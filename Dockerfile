@@ -54,7 +54,7 @@ ENV PYTHONUNBUFFERED=1 \
 
 # Install the built wheel together with its runtime dependencies.
 COPY --from=builder /build/dist/*.whl /tmp/
-RUN python -m pip install --no-cache-dir /tmp/*.whl \
+RUN pip install --no-cache-dir "$(ls /tmp/*.whl)[geo]" \
     && rm -f /tmp/*.whl
 
 # Single appdata mount point holding the Config_File, History_Store,
