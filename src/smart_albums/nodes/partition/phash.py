@@ -12,7 +12,7 @@ import logging
 from collections import defaultdict
 
 from smart_albums.core.context import PipelineContext, ContextBatch
-from smart_albums.core.models import Asset
+from protocols_system.protocols import Asset
 from smart_albums.core.node import Stage, ConfigParam
 from smart_albums.utils.phash_utils import hamming_distance as _hamming_distance
 from smart_albums.core.registry import stage

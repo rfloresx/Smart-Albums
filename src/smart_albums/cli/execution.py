@@ -9,7 +9,7 @@ from typing import Any, Optional
 from rich.console import Console
 from rich.table import Table
 
-from smart_albums.core.protocol_registry import ProtocolsRegistry
+from protocols_system import ProtocolsRegistry
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -113,7 +113,7 @@ async def execute_pipeline(
         # Register context-managed instances in the ProtocolsRegistry.
         # Some clients are async context managers (their reference may change
         # after __aenter__), so we clear and re-register all of them.
-        from smart_albums.core.protocols import (
+        from protocols_system.protocols import (
             ICacheManager,
             IEmbeddingClient,
             IImageClient,

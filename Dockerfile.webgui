@@ -57,9 +57,13 @@ RUN pip install --no-cache-dir \
 
 # Install the main package from the wheel with all required extras.
 # torch is already satisfied from above so pip won't re-download it.
+# git is needed only to resolve the protocols-system git dependency; it is
+# purged in the same layer to keep the image small.
 COPY --from=builder /build/dist/*.whl /tmp/
-RUN pip install --no-cache-dir "$(ls /tmp/*.whl)[geo,huggingface,openai,webgui]" \
-    && rm -f /tmp/*.whl
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && pip install --no-cache-dir "$(ls /tmp/*.whl)[geo,huggingface,openai,webgui]" \
+    && apt-get purge -y --auto-remove git \
+    && rm -rf /var/lib/apt/lists/* /tmp/*.whl
 
 # Copy the webgui package, scripts, and default prompts
 COPY src/webgui /app/webgui

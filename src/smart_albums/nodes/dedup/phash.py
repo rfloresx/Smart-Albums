@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 
 from smart_albums.core.context import PipelineContext, ContextBatch
-from smart_albums.core.models import Asset
+from protocols_system.protocols import Asset
 from smart_albums.core.node import Stage, ConfigParam
 from smart_albums.utils.phash_utils import hamming_distance as _hamming_distance
 from smart_albums.core.registry import stage
@@ -36,8 +36,9 @@ def _find_duplicate_groups(
     # Group eligible asset indices by calendar day
     day_buckets: dict[str, list[int]] = defaultdict(list)
     for i in eligible_indices:
-        if assets[i].captured_at is not None:
-            day_key = assets[i].captured_at.strftime("%Y-%m-%d")
+        captured_at = assets[i].captured_at
+        if captured_at is not None:
+            day_key = captured_at.strftime("%Y-%m-%d")
         else:
             day_key = "_untimed"
         day_buckets[day_key].append(i)

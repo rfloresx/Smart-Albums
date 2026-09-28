@@ -14,7 +14,7 @@ import logging
 from typing import Any
 
 from smart_albums.core.context import ContextBatch, PipelineContext
-from smart_albums.core.models import Asset
+from protocols_system.protocols import Asset
 from smart_albums.core.node import ConfigParam, Stage
 from smart_albums.core.registry import stage
 

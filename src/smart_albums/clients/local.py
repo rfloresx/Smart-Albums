@@ -20,9 +20,9 @@ from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
 
-from smart_albums.core.models import AlbumResult, AlbumSummary, Asset
-from smart_albums.core.protocol_registry import ProtocolsRegistry
-from smart_albums.core.protocols import (
+from protocols_system.protocols import AlbumResult, AlbumSummary, Asset
+from protocols_system import ProtocolsRegistry
+from protocols_system.protocols import (
     IHealthCheck,
     IImageClient,
 )

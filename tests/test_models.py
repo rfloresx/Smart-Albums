@@ -1,10 +1,10 @@
-"""Tests for smart_albums.core.models."""
+"""Tests for the shared protocols_system Asset model."""
 
 from __future__ import annotations
 
 from datetime import datetime
 
-from smart_albums.core.models import Asset
+from protocols_system.protocols import Asset
 
 
 class TestAsset:

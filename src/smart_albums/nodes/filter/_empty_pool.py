@@ -7,7 +7,7 @@ from typing import Sequence
 from enum import Enum
 
 from smart_albums.core.context import PipelineContext
-from smart_albums.core.models import Asset
+from protocols_system.protocols import Asset
 from smart_albums.core.node import ConfigParam, PipelineNode
 
 

@@ -36,6 +36,7 @@ dependencies = [
     "PyYAML>=6.0,<7",
     "faiss-cpu>=1.7.4,<2",
     "numpy>=1.24.0,<3",
+    "protocols-system @ git+https://github.com/rfloresx/ProtocolsSystem.git",
 ]
 
 [project.optional-dependencies]
@@ -114,6 +115,10 @@ disable_error_code = ["no-untyped-call", "union-attr", "operator", "attr-defined
 [[tool.mypy.overrides]]
 module = "smart_albums.clients.immich"
 disable_error_code = ["call-arg", "arg-type", "attr-defined"]
+
+[tool.hatch.metadata]
+# Required to allow the git direct reference for protocols-system.
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/smart_albums", "src/webgui"]

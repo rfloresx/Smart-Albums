@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from smart_albums.utils.split import split_contexts
-from smart_albums.core.models import Asset
+from protocols_system.protocols import Asset
 
 from conftest import make_asset, make_context
 

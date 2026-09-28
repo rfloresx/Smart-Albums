@@ -17,8 +17,8 @@ from pathlib import Path
 from threading import RLock
 from typing import Any, Optional
 
-from smart_albums.core.protocol_registry import ProtocolsRegistry
-from smart_albums.core.protocols import ICache, ICacheManager
+from protocols_system import ProtocolsRegistry
+from protocols_system.protocols import ICache, ICacheManager
 
 logger = logging.getLogger(__name__)
 

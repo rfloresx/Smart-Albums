@@ -7,7 +7,7 @@ import math
 from collections import defaultdict
 
 from smart_albums.core.context import PipelineContext, ContextBatch
-from smart_albums.core.models import Asset
+from protocols_system.protocols import Asset
 from smart_albums.core.node import Stage, ConfigParam
 from smart_albums.core.registry import stage
 
@@ -54,7 +54,7 @@ def _two_phase_select(
     # Group by month (year-month)
     monthly: dict[str, list[Asset]] = defaultdict(list)
     for asset in qualifying:
-        key = asset.captured_at.strftime("%Y-%m")
+        key = asset.captured_at.strftime("%Y-%m") if asset.captured_at is not None else "_untimed"
         monthly[key].append(asset)
 
     # Sort each month by score descending

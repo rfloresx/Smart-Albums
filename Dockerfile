@@ -53,9 +53,13 @@ ENV PYTHONUNBUFFERED=1 \
     ROTATION_CONFIG=/config/rotation.yaml
 
 # Install the built wheel together with its runtime dependencies.
+# git is needed only to resolve the protocols-system git dependency; it is
+# purged in the same layer to keep the image small.
 COPY --from=builder /build/dist/*.whl /tmp/
-RUN pip install --no-cache-dir "$(ls /tmp/*.whl)[geo]" \
-    && rm -f /tmp/*.whl
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && pip install --no-cache-dir "$(ls /tmp/*.whl)[geo]" \
+    && apt-get purge -y --auto-remove git \
+    && rm -rf /var/lib/apt/lists/* /tmp/*.whl
 
 # Single appdata mount point holding the Config_File, History_Store,
 # Schedule_State, and Analysis_Cache (Req 14.4). Relative paths in the config

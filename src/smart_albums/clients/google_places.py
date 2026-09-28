@@ -22,9 +22,9 @@ import re
 import time
 from typing import Any
 
-from smart_albums.core.models import PlaceCandidate
-from smart_albums.core.protocol_registry import ProtocolsRegistry
-from smart_albums.core.protocols import (
+from protocols_system.protocols import PlaceCandidate
+from protocols_system import ProtocolsRegistry
+from protocols_system.protocols import (
     IGeoClient,
     IHealthCheck,
 )

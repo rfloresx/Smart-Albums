@@ -28,9 +28,9 @@ from tenacity import (
     wait_exponential,
 )
 
-from smart_albums.core.models import AlbumResult, AlbumSummary, Asset
-from smart_albums.core.protocol_registry import ProtocolsRegistry
-from smart_albums.core.protocols import IImageClient, IHealthCheck
+from protocols_system.protocols import AlbumResult, AlbumSummary, Asset
+from protocols_system import ProtocolsRegistry
+from protocols_system.protocols import IImageClient, IHealthCheck
 
 logger = logging.getLogger(__name__)
 

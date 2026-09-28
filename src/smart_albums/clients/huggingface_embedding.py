@@ -32,8 +32,8 @@ import io
 import logging
 from typing import TYPE_CHECKING
 
-from smart_albums.core.protocol_registry import ProtocolsRegistry
-from smart_albums.core.protocols import IEmbeddingClient, IHealthCheck
+from protocols_system import ProtocolsRegistry
+from protocols_system.protocols import IEmbeddingClient, IHealthCheck
 
 if TYPE_CHECKING:
     import torch

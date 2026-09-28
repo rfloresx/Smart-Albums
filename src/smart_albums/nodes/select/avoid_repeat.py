@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 
 from smart_albums.core.context import PipelineContext, ContextBatch
-from smart_albums.core.models import Asset
+from protocols_system.protocols import Asset
 from smart_albums.core.node import Stage, ConfigParam
 from smart_albums.core.registry import stage
 

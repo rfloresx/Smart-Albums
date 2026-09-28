@@ -10,7 +10,7 @@ import copy
 from typing import Optional
 
 from smart_albums.core.context import PipelineContext
-from smart_albums.core.models import Asset
+from protocols_system.protocols import Asset
 
 
 def split_contexts(

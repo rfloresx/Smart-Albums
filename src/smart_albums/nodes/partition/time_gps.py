@@ -15,7 +15,7 @@ import math
 from datetime import timedelta
 
 from smart_albums.core.context import PipelineContext, ContextBatch
-from smart_albums.core.models import Asset
+from protocols_system.protocols import Asset
 from smart_albums.core.node import Stage, ConfigParam
 from smart_albums.core.registry import stage
 from smart_albums.utils.split import split_contexts
@@ -106,6 +106,10 @@ class PartitionTimeGps(Stage):
         partitions: list[list[Asset]] = [[sorted_assets[0]]]
         for asset in sorted_assets[1:]:
             prev = partitions[-1][-1]
+            # Both are timed (filtered above); guard narrows the optional type.
+            if asset.captured_at is None or prev.captured_at is None:
+                partitions.append([asset])
+                continue
             time_ok = (asset.captured_at - prev.captured_at) <= time_window
             gps_ok = _gps_within(prev, asset, gps_window)
 

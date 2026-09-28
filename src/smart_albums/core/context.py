@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
-from smart_albums.core.models import Asset
+from protocols_system.protocols import Asset
 
 
 @dataclass

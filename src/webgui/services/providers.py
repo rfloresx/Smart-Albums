@@ -28,8 +28,8 @@ from typing import Any
 from smart_albums.cli.imports import import_clients
 from smart_albums.core.builder import get_init_schema
 from smart_albums.core.node import ConfigParam
-from smart_albums.core.protocol_registry import ProtocolsRegistry
-from smart_albums.core.protocols import (
+from protocols_system import ProtocolsRegistry
+from protocols_system.protocols import (
     ICache,
     ICacheManager,
     IEmbeddingClient,
@@ -349,7 +349,7 @@ async def test_connection(
         return False, "No provider selected"
 
     try:
-        client = ProtocolsRegistry.create(slot.protocol, provider_name, params)
+        client: Any = ProtocolsRegistry.create(slot.protocol, provider_name, params)
     except Exception as exc:  # noqa: BLE001 — surface any construction error
         logger.warning("Provider instantiation failed: %s", exc)
         return False, f"Could not create provider: {exc}"

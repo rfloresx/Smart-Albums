@@ -6,7 +6,7 @@ import pytest
 
 from smart_albums.nodes.publish.create_album import PublishCreateAlbum
 from smart_albums.nodes.publish.replace_album import PublishReplaceAlbum
-from smart_albums.core.models import AlbumSummary
+from protocols_system.protocols import AlbumSummary
 
 from conftest import make_asset, make_context, FakeImageClient
 

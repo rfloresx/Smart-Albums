@@ -11,8 +11,8 @@ from __future__ import annotations
 from datetime import date, datetime, time, timedelta
 from typing import Any, Protocol, runtime_checkable
 
-from smart_albums.core.models import Asset
-from smart_albums.core.protocols import IImageClient
+from protocols_system.protocols import Asset
+from protocols_system.protocols import IImageClient
 
 
 @runtime_checkable

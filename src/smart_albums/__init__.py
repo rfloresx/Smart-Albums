@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from smart_albums.core.context import PipelineContext
 from smart_albums.nodes.fork.fork import Fork, ForkBySelection
-from smart_albums.core.models import Asset
+from protocols_system.protocols import Asset
 from smart_albums.core.node import ConfigParam
 from smart_albums.core.registry import (
     get_stage_config,

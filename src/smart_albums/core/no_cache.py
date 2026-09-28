@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from smart_albums.core.protocol_registry import ProtocolsRegistry
-from smart_albums.core.protocols import ICacheManager
+from protocols_system import ProtocolsRegistry
+from protocols_system.protocols import ICacheManager
 
 
 @ProtocolsRegistry.register("disabled", ICacheManager)
