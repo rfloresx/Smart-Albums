@@ -7,7 +7,7 @@ import time
 
 from typing import Any
 
-from smart_albums.core.context import ContextBatch, PipelineContext
+from smart_albums.core.context import ContextBatch
 from smart_albums.core.node import PipelineNode
 from smart_albums.core.spec import Pipeline, StepSpec
 
@@ -16,6 +16,71 @@ import smart_albums.core.builder as builder
 import smart_albums.core.registry as registry
 
 logger = logging.getLogger(__name__)
+
+
+def _coerce_and_validate(param: Any, value: Any, stage_name: str) -> Any:
+    """Coerce ``value`` to ``param.type`` and enforce min/max/choices (CO-09).
+
+    ``build_node`` previously passed config values through untouched: a
+    ``ConfigParam``'s declared ``type``, ``min``, ``max``, and ``choices``
+    were pure documentation that nothing enforced, so an out-of-range
+    threshold, a value of the wrong type (e.g. the string ``"5"`` for an
+    ``int`` param coming from a JSON/web config), or a bogus ``choices``
+    value flowed straight into the stage and failed — if at all — much
+    later and far less clearly. This coerces common scalar types and
+    rejects out-of-range / invalid-choice values up front with a message
+    naming the stage and key.
+    """
+    if value is None:
+        return value
+
+    expected = param.type
+    # Coerce common scalar types. bool is handled explicitly because
+    # ``bool("false")`` is True — a classic footgun for string configs.
+    try:
+        if expected is bool and not isinstance(value, bool):
+            if isinstance(value, str):
+                lowered = value.strip().lower()
+                if lowered in ("true", "1", "yes", "on"):
+                    value = True
+                elif lowered in ("false", "0", "no", "off"):
+                    value = False
+                else:
+                    raise ValueError(f"cannot interpret {value!r} as a boolean")
+            else:
+                value = bool(value)
+        elif expected is int and not isinstance(value, bool) and not isinstance(value, int):
+            value = int(value)
+        elif expected is float and not isinstance(value, float):
+            # Accept int→float silently; reject non-numeric strings.
+            if isinstance(value, (int, str)):
+                value = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Config '{param.key}' for stage '{stage_name}' must be "
+            f"{getattr(expected, '__name__', expected)!r}: {exc}"
+        ) from exc
+
+    if param.choices is not None and value not in param.choices:
+        raise ValueError(
+            f"Config '{param.key}' for stage '{stage_name}' must be one of "
+            f"{param.choices}; got {value!r}"
+        )
+
+    if param.min is not None and isinstance(value, (int, float)) and not isinstance(value, bool):
+        if value < param.min:
+            raise ValueError(
+                f"Config '{param.key}' for stage '{stage_name}' must be "
+                f">= {param.min}; got {value!r}"
+            )
+    if param.max is not None and isinstance(value, (int, float)) and not isinstance(value, bool):
+        if value > param.max:
+            raise ValueError(
+                f"Config '{param.key}' for stage '{stage_name}' must be "
+                f"<= {param.max}; got {value!r}"
+            )
+
+    return value
 
 
 def build_node(spec: StepSpec) -> PipelineNode:
@@ -45,7 +110,9 @@ def build_node(spec: StepSpec) -> PipelineNode:
     for key, param in schema.items():
 
         if key in spec.config:
-            config[key] = spec.config[key]
+            # Coerce + validate caller-supplied values (CO-09). Defaults
+            # declared on the ConfigParam are trusted as-is.
+            config[key] = _coerce_and_validate(param, spec.config[key], spec.name)
 
         elif param.default is not None:
             config[key] = param.default
@@ -89,11 +156,29 @@ async def run_pipeline(
     contexts: ContextBatch,
 ) -> ContextBatch:
     """Build and execute a pipeline against the given contexts."""
+    global _pipeline_depth
     specs = builder.build_pipeline(pipeline)
 
-    # Notify progress reporter of pipeline-level structure
-    _notify_pipeline_start(contexts, len(specs))
+    is_outermost = _pipeline_depth == 0
+    _pipeline_depth += 1
+    try:
+        # Only the outermost pipeline reports pipeline-level structure;
+        # nested composite/fork sub-pipelines must not reset the reporter's
+        # global stage counters (CO-11).
+        if is_outermost:
+            _notify_pipeline_start(contexts, len(specs))
+        return await _run_pipeline_body(specs, contexts, report_stages=is_outermost)
+    finally:
+        _pipeline_depth -= 1
 
+
+async def _run_pipeline_body(
+    specs: list[StepSpec],
+    contexts: ContextBatch,
+    *,
+    report_stages: bool,
+) -> ContextBatch:
+    """Execute already-built pipeline specs. See ``run_pipeline``."""
     for stage_idx, spec in enumerate(specs):
         spec_name = spec.name or "<unnamed>"
         if spec.alias:
@@ -102,8 +187,9 @@ async def run_pipeline(
         assets_count = sum([len(ctx.assets) for ctx in contexts])
         logger.info("Stage %-35s  starting  (%d ctx) (%d assets)", spec_name, len(contexts), assets_count)
 
-        # Notify progress reporter of stage-level entry
-        _notify_stage_enter(contexts, stage_idx, spec_name)
+        # Notify progress reporter of stage-level entry (outermost only)
+        if report_stages:
+            _notify_stage_enter(contexts, stage_idx, spec_name)
 
         # Debug: log effective config for this node
         if logger.isEnabledFor(logging.DEBUG):
@@ -195,6 +281,16 @@ def _summarise(contexts: ContextBatch) -> str:
 # ---------------------------------------------------------------------------
 # Progress notification helpers
 # ---------------------------------------------------------------------------
+
+
+# Tracks pipeline nesting depth. Composite and fork nodes execute their
+# own sub-pipelines by re-entering `run_pipeline`; those nested calls must
+# NOT emit pipeline-level progress (start_pipeline / set_stage_index),
+# because doing so reset the reporter's `_total_stages`/`_stage_index` to
+# the sub-pipeline's values and the web GUI then showed the sub-pipeline's
+# position as the global one (CO-11). Only the outermost call (depth 0)
+# reports pipeline-level structure; nesting is gated by ``run_pipeline``.
+_pipeline_depth = 0
 
 
 def _notify_pipeline_start(contexts: ContextBatch, total_stages: int) -> None:

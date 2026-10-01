@@ -49,7 +49,48 @@ class TestFindDuplicateGroups:
             make_asset(id="a2", captured_at=datetime(2024, 1, 2), metadata={"phash": "abcdef1234567890"}),
         ]
         groups = _find_duplicate_groups(assets, max_distance=5)
-        # Different days → not compared → no groups
+        # Midnight-to-midnight is a full 24h apart — far outside the
+        # cross-boundary window — so these are still not grouped (ND-14
+        # only bridges the boundary for assets within an hour of it).
+        assert groups == []
+
+    def test_burst_crossing_midnight_grouped(self):
+        # A burst that straddles midnight: 23:58 on Jan 1 and 00:02 on
+        # Jan 2 are 4 minutes apart but land in different calendar-day
+        # buckets. They must still be recognized as duplicates (ND-14).
+        assets = [
+            make_asset(
+                id="before",
+                captured_at=datetime(2024, 1, 1, 23, 58),
+                metadata={"phash": "abcdef1234567890"},
+            ),
+            make_asset(
+                id="after",
+                captured_at=datetime(2024, 1, 2, 0, 2),
+                metadata={"phash": "abcdef1234567890"},
+            ),
+        ]
+        groups = _find_duplicate_groups(assets, max_distance=5)
+        assert len(groups) == 1
+        assert len(groups[0]) == 2
+
+    def test_adjacent_days_but_far_from_midnight_not_grouped(self):
+        # Consecutive days but both near midday — far from the shared
+        # midnight boundary, so the cross-day comparison window does not
+        # apply and they stay separate.
+        assets = [
+            make_asset(
+                id="a1",
+                captured_at=datetime(2024, 1, 1, 12, 0),
+                metadata={"phash": "abcdef1234567890"},
+            ),
+            make_asset(
+                id="a2",
+                captured_at=datetime(2024, 1, 2, 12, 0),
+                metadata={"phash": "abcdef1234567890"},
+            ),
+        ]
+        groups = _find_duplicate_groups(assets, max_distance=5)
         assert groups == []
 
     def test_assets_without_phash_ignored(self):

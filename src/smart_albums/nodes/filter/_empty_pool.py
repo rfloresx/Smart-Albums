@@ -40,10 +40,39 @@ def handle_empty_pool(
         produces an empty result (skip, or fallback_random with empty input).
     """
 
-    if candidates:
-        return candidates[:photo_count]
+    # Normalize and validate the configured behavior up front. An
+    # unrecognized value (a typo, or a value from a stale config) used to
+    # silently fall through to the SKIP branch at the bottom — so a
+    # misconfigured "fallbackrandom" quietly dropped the whole pool
+    # instead of doing what the author intended (ND-15). Fail loudly
+    # instead.
+    raw_behavior = node.get("on_empty_pool")
+    if raw_behavior is None:
+        # Not set (or defaults not materialized) — use the documented
+        # default rather than erroring.
+        behavior = EmptyBehavior.SKIP
+    else:
+        try:
+            behavior = EmptyBehavior(raw_behavior)
+        except ValueError as exc:
+            valid = ", ".join(b.value for b in EmptyBehavior)
+            raise ValueError(
+                f"Invalid on_empty_pool value {raw_behavior!r}; expected one of: {valid}"
+            ) from exc
 
-    behavior = node.get("on_empty_pool")
+    if candidates:
+        if len(candidates) <= photo_count:
+            return candidates
+        # When the filter leaves more candidates than requested, take a
+        # random sample rather than ``candidates[:photo_count]`` — the
+        # slice kept the first N in whatever order the server/filter
+        # happened to return (typically newest-first or an arbitrary
+        # scan order), which systematically biased the output toward one
+        # end of the pool instead of representing it (ND-16).
+        seed = node.get("rng_seed")
+        rng = random.Random(seed) if seed is not None else random.Random()
+        return rng.sample(candidates, photo_count)
+
     recipe_name = node.config.get("recipe_name", "<unnamed>")
 
     if behavior == EmptyBehavior.FAIL:

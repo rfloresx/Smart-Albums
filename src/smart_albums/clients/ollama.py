@@ -21,6 +21,12 @@ from tenacity import (
 from protocols_system import ProtocolsRegistry
 from protocols_system.protocols import ILLMClient, IEmbeddingClient, IHealthCheck
 
+from smart_albums.clients._llm_support import (
+    ImageConversionError as _ImageConversionError,
+    prepare_image_for_vision as _prepare_image_for_vision,
+    validate_against_schema as _validate_against_schema,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -32,36 +38,6 @@ _retry_policy = retry(
     reraise=True,
 )
 
-
-def _validate_against_schema(data: dict[str, Any], schema: dict[str, Any]) -> str | None:
-    """Validate a dict against a simplified JSON schema.
-
-    Returns None if valid, or an error message string if validation fails.
-    Supports checking required keys and basic type constraints from the
-    schema's "properties" and "required" fields.
-    """
-    required_keys = schema.get("required", [])
-    properties = schema.get("properties", {})
-
-    for key in required_keys:
-        if key not in data:
-            return f"Missing required key: '{key}'"
-
-    for key, prop_schema in properties.items():
-        if key not in data:
-            continue
-        expected_type = prop_schema.get("type")
-        value = data[key]
-        if expected_type == "number" and not isinstance(value, (int, float)):
-            return f"Key '{key}' expected number, got {type(value).__name__}"
-        if expected_type == "string" and not isinstance(value, str):
-            return f"Key '{key}' expected string, got {type(value).__name__}"
-        if expected_type == "boolean" and not isinstance(value, bool):
-            return f"Key '{key}' expected boolean, got {type(value).__name__}"
-        if expected_type == "array" and not isinstance(value, list):
-            return f"Key '{key}' expected array, got {type(value).__name__}"
-
-    return None
 
 @ProtocolsRegistry.register("ollama", ILLMClient)
 @ProtocolsRegistry.register("ollama", IEmbeddingClient)
@@ -91,10 +67,14 @@ class OllamaClient:
         base_url: str,
         vision_model: str,
         embed_model: str,
+        timeout: float = 120.0,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._vision_model = vision_model
         self._embed_model = embed_model
+        # Without a timeout the ollama AsyncClient would wait forever on a
+        # stuck model load, hanging the whole pipeline (CL-06).
+        self._timeout = float(timeout)
         self._client: AsyncClient | None = None
 
     @property
@@ -110,13 +90,11 @@ class OllamaClient:
     # ------------------------------------------------------------------
 
     async def __aenter__(self) -> "OllamaClient":
-        self._client = AsyncClient(host=self._base_url)
+        self._client = AsyncClient(host=self._base_url, timeout=self._timeout)
         return self
 
     async def __aexit__(self, *args: object) -> None:
-        # The ollama AsyncClient doesn't require explicit cleanup,
-        # but we clear the reference for consistency.
-        self._client = None
+        await self.close()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -125,7 +103,7 @@ class OllamaClient:
     def _get_client(self) -> AsyncClient:
         """Return the active client, creating one lazily if needed."""
         if self._client is None:
-            self._client = AsyncClient(host=self._base_url)
+            self._client = AsyncClient(host=self._base_url, timeout=self._timeout)
         return self._client
 
     # ------------------------------------------------------------------
@@ -160,6 +138,14 @@ class OllamaClient:
         Raises:
             ConnectionError: On transient connection errors (retried by tenacity).
         """
+        # Normalize non-JPEG/PNG formats (HEIC/TIFF/BMP/GIF/WebP) to JPEG
+        # before sending, and fail cleanly if conversion isn't possible
+        # rather than handing the model undecodable bytes (CL-08).
+        try:
+            prepared_bytes, _mime = _prepare_image_for_vision(image_bytes)
+        except _ImageConversionError as exc:
+            return {"error": f"Image conversion failed: {exc}"}
+
         try:
             response = await self._get_client().chat(
                 model=self._vision_model,
@@ -167,14 +153,26 @@ class OllamaClient:
                     {
                         "role": "user",
                         "content": prompt,
-                        "images": [image_bytes],
+                        "images": [prepared_bytes],
                     }
                 ],
                 format="json",
                 think=False,
             )
         except ResponseError as exc:
-            # Non-transient API error (e.g. model not found)
+            # A 5xx status (500/503) usually means the server is still
+            # loading the model or is transiently out of memory — the same
+            # condition the OpenAI and llama.cpp clients retry on. The old
+            # code treated *every* ResponseError as permanent and returned a
+            # per-image error, so a cold model load failed every in-flight
+            # image instead of being retried (CL-06). Wrap 5xx as a
+            # ConnectionError so tenacity retries; keep 4xx (e.g. model not
+            # found) permanent.
+            status = getattr(exc, "status_code", None)
+            if status is not None and status >= 500:
+                raise ConnectionError(
+                    f"Ollama server error (HTTP {status}): {exc}"
+                ) from exc
             return {"error": f"Ollama API error: {exc}"}
         except (ConnectionError, OSError, TimeoutError) as exc:
             # Transient connection errors — wrap for tenacity to retry
@@ -201,63 +199,44 @@ class OllamaClient:
         result_dict: dict[str, Any] = parsed
         return result_dict
 
-    @_retry_policy
     async def embed(self, image_bytes: bytes) -> list[float]:
-        """Generate an embedding vector for an image.
+        """Raise: Ollama's ``/api/embed`` endpoint embeds text, not images.
 
-        Sends raw image bytes to the Ollama embed endpoint via the official
-        library. The library handles encoding internally.
-
-        Args:
-            image_bytes: Raw image bytes (JPEG, PNG, etc.).
-
-        Returns:
-            The embedding vector as a list of floats.
+        This method used to base64-encode ``image_bytes`` and pass it to
+        the embed endpoint as ``input``, but Ollama's ``embed()`` treats
+        ``input`` as text to run through the embedding model (e.g.
+        ``mxbai-embed-large``, which is a text-only model). It would embed
+        the *base64 string itself* as text — a well-formed vector, but one
+        with no relationship to the image's actual visual content. Nothing
+        about that call fails or errors, so every downstream cosine-
+        similarity comparison (near-duplicate detection, scene clustering,
+        diverse selection) silently operated on noise instead of raising
+        anything.
 
         Raises:
-            ConnectionError: If the Ollama server is unreachable (retried).
-            ResponseError: If the Ollama API returns a non-transient error
-                (e.g. model not found). Not retried.
+            NotImplementedError: Always. Use a real image-embedding
+                provider instead (``huggingface``, ``image_embedding``), or
+                caption the image with the vision model first and embed
+                the resulting text.
         """
-        try:
-            response = await self._get_client().embed(
-                model=self._embed_model,
-                input=image_bytes,  # type: ignore[arg-type]
-            )
-            return [float(x) for x in response.embeddings[0]]
-        except ResponseError:
-            # Permanent API error (e.g. model not found) — do not wrap as
-            # ConnectionError, let it propagate immediately without retry.
-            raise
-        except (ConnectionError, OSError, TimeoutError) as exc:
-            raise ConnectionError(
-                f"Cannot reach Ollama server at {self._base_url}: {exc}"
-            ) from exc
+        raise NotImplementedError(
+            "Ollama's /api/embed endpoint embeds text, not images — passing "
+            "image bytes to it silently produces meaningless vectors rather "
+            "than an error. Use a dedicated image-embedding provider "
+            "(huggingface, image_embedding) instead."
+        )
 
     async def embed_batch(
         self,
         image_bytes_list: list[bytes],
     ) -> list[list[float] | None]:
-        """Compute embedding vectors for a list of images sequentially.
-
-        The Ollama API processes one image at a time, so this calls embed()
-        for each image individually. Images that fail are returned as None.
-
-        Args:
-            image_bytes_list: Raw image bytes for each image to embed.
-
-        Returns:
-            A list of the same length as input. Each entry is either a
-            list[float] embedding vector, or None on failure.
-        """
-        results: list[list[float] | None] = []
-        for image_bytes in image_bytes_list:
-            try:
-                embedding = await self.embed(image_bytes)
-                results.append(embedding)
-            except Exception:
-                results.append(None)
-        return results
+        """Raise: see ``embed()`` — Ollama's embed endpoint doesn't do images."""
+        raise NotImplementedError(
+            "Ollama's /api/embed endpoint embeds text, not images — passing "
+            "image bytes to it silently produces meaningless vectors rather "
+            "than an error. Use a dedicated image-embedding provider "
+            "(huggingface, image_embedding) instead."
+        )
 
     async def close(self) -> None:
         """Release client resources."""

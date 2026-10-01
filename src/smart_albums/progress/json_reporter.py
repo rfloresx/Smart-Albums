@@ -103,14 +103,20 @@ class JsonProgressReporter:
         """
         self._completed += n
 
-        # Throttle: emit if >=1s elapsed or >=2% progress since last emit
+        # Throttle: emit if >=1s elapsed or >=2% progress since last emit.
         now = time.monotonic()
         elapsed = now - self._last_advance_time
         pct_delta = 0.0
+        # Only treat "reached the total" as a reason to emit when the total
+        # is actually known (> 0). With total=None (→ _total=0), the old
+        # ``self._completed >= self._total`` condition was 0 >= 0 → True on
+        # every single advance, so an unbounded stage emitted a progress
+        # line per item and flooded the parser (CO-11).
+        reached_total = self._total > 0 and self._completed >= self._total
         if self._total > 0:
             pct_delta = (self._completed - self._last_advance_completed) / self._total
 
-        if elapsed >= 1.0 or pct_delta >= 0.02 or self._completed >= self._total:
+        if elapsed >= 1.0 or pct_delta >= 0.02 or reached_total:
             self._last_advance_time = now
             self._last_advance_completed = self._completed
             self._emit({

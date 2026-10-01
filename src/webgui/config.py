@@ -10,12 +10,15 @@ resolution pattern.
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from typing import Any, Optional
 
 import yaml
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 
 class ProviderConfig(BaseModel):
@@ -59,13 +62,33 @@ class AppConfig(BaseModel):
 
 def _resolve_data_dir(configured_path: str, fallback_name: str) -> str:
     """Resolve a data directory path, falling back to a local directory if the
-    configured path isn't writable (e.g. running outside Docker)."""
+    configured path isn't writable (e.g. running outside Docker).
+
+    A Docker named-volume mount point (e.g. ``/data/exports``) can exist as
+    a root-owned directory created by the container runtime before the
+    image's own ``chown`` step ever touches it — e.g. if a volume defined
+    in compose has no matching ``mkdir``/``chown`` in the image, or a
+    future compose change adds a new mount the image doesn't yet know
+    about. The second branch below previously `mkdir`'d (a no-op since the
+    directory already existed) and returned the path solely because the
+    *parent* was writable, without checking that the directory itself
+    actually ended up writable by this process — so a root-owned mount
+    point was treated as "resolved" and every write under it then failed
+    with ``PermissionError`` at job-run time instead of at startup (WG-25).
+    """
     p = Path(configured_path)
     if p.exists() and os.access(str(p), os.W_OK):
         return str(p)
     if p.parent.exists() and os.access(str(p.parent), os.W_OK):
         p.mkdir(parents=True, exist_ok=True)
-        return str(p)
+        if os.access(str(p), os.W_OK):
+            return str(p)
+        logger.warning(
+            "Data directory %s exists but is not writable by this process "
+            "(likely a root-owned Docker volume mount point) — falling back "
+            "to a local directory instead.",
+            p,
+        )
     local = Path(__file__).parent / ".data" / fallback_name
     local.mkdir(parents=True, exist_ok=True)
     return str(local)

@@ -193,11 +193,24 @@ def build_alias_map(pipeline: Pipeline) -> dict[str, int]:
                 )
             alias_map[name] = i
         else:
-            # Auto-alias from stage name
+            # Auto-alias from stage name. `auto_counts` only de-duplicates
+            # against *other* auto-generated aliases of the same stage
+            # name — it was never checked against aliases already present
+            # in `alias_map` from an explicit AliasedStep. So an explicit
+            # alias("scenes", ...) at an earlier index, followed by an
+            # unaliased stage named "scenes" later in the same pipeline,
+            # silently produced the same auto-alias "scenes" and
+            # overwrote the explicit entry in `alias_map` — any config
+            # override or composite dot-path override targeting "scenes"
+            # then silently applied to the wrong step (CO-14).
             stage_name = _extract_stage_name(step)
             auto_counts[stage_name] += 1
             count = auto_counts[stage_name]
             auto_alias = stage_name if count == 1 else f"{stage_name}_{count}"
+            while auto_alias in alias_map:
+                count += 1
+                auto_alias = f"{stage_name}_{count}"
+            auto_counts[stage_name] = count
             alias_map[auto_alias] = i
 
     return alias_map
@@ -261,12 +274,63 @@ def resolve_overrides(
             original_alias = step.alias
             raw_step = step.step
 
+        if isinstance(raw_step, PipelineNode):
+            # A direct (non-dot-path) override on a step that is already a
+            # constructed PipelineNode *instance* — e.g. best_of_year's
+            # `alias("output", ForkBySelection(Branch(...), Branch(...)))`
+            # — used to be rebuilt as a plain `(name, merged_config)` tuple.
+            # _extract_config() returns {} for an instance (it only knows
+            # how to read config out of tuples/StepSpecs), so `merged` was
+            # just the override dict, and build_node() would then call
+            # `cls(config)` with that dict as the constructor's first
+            # positional argument. For Fork/ForkBySelection that argument
+            # is `*args: Branch`, so the override dict got treated as a
+            # single Branch and wrapped as `Branch(name="branch_0",
+            # pipeline=<the override dict>)` — silently discarding every
+            # real branch and pipeline the instance was built with, and
+            # producing a broken node that fails deep inside run_pipeline
+            # with a confusing "Unknown stage" error.
+            from smart_albums.core.node import CompositeNode
+
+            if isinstance(raw_step, CompositeNode):
+                # CompositeNode subclasses resolve their internal
+                # sub-pipeline once, in __init__, from their config. There
+                # is no supported way to apply a config change to an
+                # already-built instance after the fact (updating
+                # .config wouldn't touch the already-resolved
+                # _resolved_pipeline), so fail loudly instead of silently
+                # doing nothing or corrupting the instance.
+                raise ValueError(
+                    f"Cannot apply a direct config override to alias "
+                    f"'{alias_key}': it is a pre-built {type(raw_step).__name__} "
+                    f"instance (a CompositeNode). Pass its config as a "
+                    f"(name, config) tuple or class reference instead of a "
+                    f"constructed instance if you need to override it, or "
+                    f"target a specific child via a dot-path override."
+                )
+
+            # For a plain PipelineNode instance (e.g. Fork/ForkBySelection,
+            # which read from self.branches rather than self.config for
+            # anything that matters), merge the override into a shallow
+            # copy of the instance instead of discarding it. copy.copy
+            # keeps the original object (and any pipeline that reuses the
+            # same module-level instance, as best_of_year.py does) intact.
+            import copy as _copy
+
+            new_instance = _copy.copy(raw_step)
+            new_instance.config = {**raw_step.config, **config}
+            new_step: StepInput = new_instance
+            if original_alias is not None:
+                new_step = AliasedStep(alias=original_alias, step=new_instance)
+            result[idx] = new_step
+            continue
+
         name = _extract_stage_name(raw_step)
         existing_config = _extract_config(raw_step)
         merged = {**existing_config, **config}
 
         # Rebuild as (name, config) tuple wrapped in AliasedStep
-        new_step: StepInput = (name, merged)
+        new_step = (name, merged)
         if original_alias is not None:
             new_step = AliasedStep(alias=original_alias, step=new_step)
 
@@ -283,6 +347,8 @@ def resolve_overrides(
             original_alias = step.alias
             raw_step = step.step
 
+        applied_keys: set[str] = set()
+
         # For composite nodes (PipelineNode instances with CompositeParam),
         # we pass the sub-overrides through as nested config
         if isinstance(raw_step, PipelineNode):
@@ -294,7 +360,6 @@ def resolve_overrides(
             if composite_params:
                 param = composite_params[0]
                 children = param.resolve(raw_step)
-                prefix = f"{root_alias}."
                 # Route overrides to the appropriate child pipeline
                 updated_children: list[tuple[str, Pipeline]] = []
                 for branch_name, branch_pipeline in children:
@@ -304,6 +369,7 @@ def resolve_overrides(
                         if full_key.startswith(branch_prefix):
                             child_alias = full_key[len(branch_prefix):]
                             branch_overrides[child_alias] = cfg
+                            applied_keys.add(full_key)
                     if branch_overrides:
                         branch_pipeline = resolve_overrides(
                             branch_pipeline, branch_overrides
@@ -316,5 +382,77 @@ def resolve_overrides(
                 if original_alias is not None:
                     new_step = AliasedStep(alias=original_alias, step=new_instance)
                 result[idx] = new_step
+
+        elif isinstance(raw_step, (tuple, StepSpec)):
+            # A fork (or any other CompositeParam-bearing stage) expressed
+            # as a raw (name, config) tuple or StepSpec, rather than a
+            # constructed instance — this is exactly how JSON pipeline
+            # definitions parsed by ``cli/app.py``'s `run` command
+            # represent a fork (see ``_parse_step_config``), so any
+            # pipeline built that way silently ignored every
+            # "<alias>.branches.<branch_name>.<child_alias>"-style
+            # pipeline_settings override with no error at all — the value
+            # simply never reached the branch's pipeline. This mirrors the
+            # PipelineNode-instance branch above, but reads/writes the
+            # config dict's "branches" key directly instead of going
+            # through CompositeParam.resolve()/.build(), since there's no
+            # instance yet to resolve from.
+            stage_name = _extract_stage_name(raw_step)
+            step_config = _extract_config(raw_step)
+
+            from smart_albums.core.node import CompositeParam
+
+            composite_params = [
+                p for p in registry.get_stage_config(stage_name)
+                if isinstance(p, CompositeParam)
+            ]
+            if composite_params and composite_params[0].key in step_config:
+                param = composite_params[0]
+                branches_raw = step_config[param.key]
+
+                if isinstance(branches_raw, dict):
+                    branch_items: list[tuple[str, Any]] = list(branches_raw.items())
+                    is_dict_format = True
+                else:
+                    branch_items = [(item[0], item[1]) for item in branches_raw]
+                    is_dict_format = False
+
+                updated_items: list[tuple[str, Any]] = []
+                for branch_name, branch_pipeline in branch_items:
+                    branch_prefix = f"{root_alias}.{param.key}.{branch_name}."
+                    branch_overrides = {}
+                    for full_key, cfg in sub_overrides.items():
+                        if full_key.startswith(branch_prefix):
+                            child_alias = full_key[len(branch_prefix):]
+                            branch_overrides[child_alias] = cfg
+                            applied_keys.add(full_key)
+                    if branch_overrides:
+                        branch_pipeline = resolve_overrides(branch_pipeline, branch_overrides)
+                    updated_items.append((branch_name, branch_pipeline))
+
+                new_branches: Any = (
+                    dict(updated_items) if is_dict_format
+                    else [[name, p] for name, p in updated_items]
+                )
+                new_config = {**step_config, param.key: new_branches}
+                new_step = (stage_name, new_config)
+                if original_alias is not None:
+                    new_step = AliasedStep(alias=original_alias, step=new_step)
+                result[idx] = new_step
+
+        # Every sub-override key must be routed to something. A key that
+        # matches neither branch prefix — a typo'd branch name, a prefix
+        # that doesn't match this stage's CompositeParam key, or an alias
+        # that turned out not to have a CompositeParam at all — used to be
+        # dropped with no error, silently doing nothing. Fail loudly
+        # instead, matching the "Unknown alias" error already raised above
+        # for a root alias that doesn't exist at all.
+        unmatched = sorted(set(sub_overrides.keys()) - applied_keys)
+        if unmatched:
+            raise ValueError(
+                f"Composite override(s) for alias '{root_alias}' did not match "
+                f"any child pipeline: {unmatched}. Check the branch name(s) "
+                f"and that '{root_alias}' has a composite/branches parameter."
+            )
 
     return result

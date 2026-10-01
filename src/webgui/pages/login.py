@@ -6,12 +6,15 @@ import logging
 import uuid
 import asyncio
 
-from nicegui import app, ui
+from nicegui import ui
 
 from webgui.auth import (
-    hash_password,
+    check_login_rate_limit,
+    clear_login_failures,
+    hash_password_async,
+    record_login_failure,
     set_authenticated,
-    verify_password,
+    verify_password_async,
 )
 from webgui.state import state
 
@@ -66,30 +69,59 @@ def _build_login_ui() -> None:
             error_label.set_visibility(False)
 
             async def handle_login() -> None:
-                username = username_input.value.strip()
-                password = password_input.value
+                # Guard against double-submit (double-click, or Enter plus a
+                # click landing before the UI disables): without this, two
+                # concurrent bcrypt verifications could run and the rate
+                # limiter/failure counter could be touched twice for one
+                # real attempt (WG-23).
+                if login_btn.props.get("disable"):
+                    return
+                login_btn.props("disable loading")
+                try:
+                    username = username_input.value.strip()
+                    password = password_input.value
 
-                if not username or not password:
-                    error_label.text = (
-                        "Username and password are required"
+                    if not username or not password:
+                        error_label.text = (
+                            "Username and password are required"
+                        )
+                        error_label.set_visibility(True)
+                        return
+
+                    rate_key = username.lower()
+                    wait = check_login_rate_limit(rate_key)
+                    if wait is not None:
+                        error_label.text = (
+                            f"Too many attempts — try again in {int(wait) + 1}s"
+                        )
+                        error_label.set_visibility(True)
+                        return
+
+                    user = await state.db.get_user(username)
+                    # verify_password_async always runs a bcrypt comparison —
+                    # against the real hash when the user exists, against a
+                    # fixed dummy hash otherwise — so response timing doesn't
+                    # reveal whether the username exists. The bcrypt call
+                    # itself runs in a worker thread, so a stream of login
+                    # attempts can no longer stall every other client's UI.
+                    valid = await verify_password_async(
+                        password, user["password_hash"] if user else None
                     )
-                    error_label.set_visibility(True)
-                    return
+                    if not valid:
+                        record_login_failure(rate_key)
+                        error_label.text = "Invalid username or password"
+                        error_label.set_visibility(True)
+                        return
 
-                user = await state.db.get_user(username)
-                if user is None or not verify_password(
-                    password, user["password_hash"]
-                ):
-                    error_label.text = "Invalid username or password"
-                    error_label.set_visibility(True)
-                    return
+                    clear_login_failures(rate_key)
+                    await set_authenticated(username)
+                    logger.info("User logged in: %s", username)
+                    await asyncio.sleep(0)
+                    ui.navigate.to("/")
+                finally:
+                    login_btn.props(remove="disable loading")
 
-                set_authenticated(username)
-                logger.info("User logged in: %s", username)
-                await asyncio.sleep(0)
-                ui.navigate.to("/")
-
-            ui.button(
+            login_btn = ui.button(
                 "Log in", on_click=handle_login
             ).classes("w-full q-mt-md").props("color=primary")
 
@@ -132,46 +164,55 @@ def _build_setup_ui() -> None:
             error_label.set_visibility(False)
 
             async def handle_setup() -> None:
-                username = username_input.value.strip()
-                password = password_input.value
-                confirm = confirm_input.value
-
-                if not username:
-                    error_label.text = "Username is required"
-                    error_label.set_visibility(True)
+                # Guard against double-submit — otherwise a double-click
+                # could race two create_user calls for the initial admin
+                # account (WG-23).
+                if setup_btn.props.get("disable"):
                     return
+                setup_btn.props("disable loading")
+                try:
+                    username = username_input.value.strip()
+                    password = password_input.value
+                    confirm = confirm_input.value
 
-                if len(password) < 8:
-                    error_label.text = (
-                        "Password must be at least 8 characters"
+                    if not username:
+                        error_label.text = "Username is required"
+                        error_label.set_visibility(True)
+                        return
+
+                    if len(password) < 8:
+                        error_label.text = (
+                            "Password must be at least 8 characters"
+                        )
+                        error_label.set_visibility(True)
+                        return
+
+                    if password != confirm:
+                        error_label.text = "Passwords do not match"
+                        error_label.set_visibility(True)
+                        return
+
+                    # Double-check no users were created in the meantime
+                    count = await state.db.user_count()
+                    if count > 0:
+                        ui.navigate.to("/login")
+                        return
+
+                    pw_hash = await hash_password_async(password)
+                    await state.db.create_user(
+                        str(uuid.uuid4()), username, pw_hash
                     )
-                    error_label.set_visibility(True)
-                    return
+                    logger.info(
+                        "Initial admin account created via setup: %s",
+                        username,
+                    )
 
-                if password != confirm:
-                    error_label.text = "Passwords do not match"
-                    error_label.set_visibility(True)
-                    return
+                    await set_authenticated(username)
+                    ui.navigate.to("/")
+                finally:
+                    setup_btn.props(remove="disable loading")
 
-                # Double-check no users were created in the meantime
-                count = await state.db.user_count()
-                if count > 0:
-                    ui.navigate.to("/login")
-                    return
-
-                pw_hash = hash_password(password)
-                await state.db.create_user(
-                    str(uuid.uuid4()), username, pw_hash
-                )
-                logger.info(
-                    "Initial admin account created via setup: %s",
-                    username,
-                )
-
-                set_authenticated(username)
-                ui.navigate.to("/")
-
-            ui.button(
+            setup_btn = ui.button(
                 "Create Account", on_click=handle_setup
             ).classes("w-full q-mt-md").props("color=primary")
 

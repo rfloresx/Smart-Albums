@@ -21,6 +21,7 @@ from webgui.services import pipelines as pipelines_service
 from webgui.services import presets as presets_service
 from webgui.services import scheduler as scheduler_service
 from webgui.services.cron import CronExpression, CronParseError
+from webgui.services.template_vars import resolve_template_variables
 
 logger = logging.getLogger(__name__)
 
@@ -42,10 +43,15 @@ _CRON_PRESETS = {
 
 
 def _fmt_time(dt: datetime | None) -> str:
-    """Format a datetime for display."""
+    """Format a datetime for display.
+
+    All schedule times are computed and stored in UTC (see
+    ``services/cron.py``); the "UTC" suffix makes that explicit instead of
+    looking like an unqualified local time.
+    """
     if dt is None:
         return "—"
-    return dt.strftime("%Y-%m-%d %H:%M")
+    return dt.strftime("%Y-%m-%d %H:%M UTC")
 
 
 def _describe_cron(expression: str) -> str:
@@ -154,18 +160,29 @@ def _build_schedule_card(schedule: ScheduleRecord, *, on_refresh, schemas: dict[
             async def do_run_now(s=schedule) -> None:
                 from webgui.services import jobs as jobs_service
 
+                # Guard against double-submit — a double-click would
+                # otherwise start two identical jobs for the same schedule
+                # (WG-23).
+                if run_now_btn.props.get("disable"):
+                    return
+                run_now_btn.props("disable loading")
                 try:
+                    settings_to_run = resolve_template_variables(
+                        s.pipeline_settings, s.template_variables
+                    )
                     record = await jobs_service.create_job(
-                        s.pipeline, s.pipeline_settings
+                        s.pipeline, settings_to_run
                     )
                     ui.notify(f"Job {record.id} started", type="positive")
                 except Exception as exc:
                     ui.notify(f"Failed: {exc}", type="negative")
+                finally:
+                    run_now_btn.props(remove="disable loading")
 
             toggle_label = "Pause" if schedule.enabled else "Enable"
             toggle_icon = "pause" if schedule.enabled else "play_arrow"
 
-            ui.button(
+            run_now_btn = ui.button(
                 "Run Now", icon="play_arrow", on_click=do_run_now
             ).props("flat size=sm color=primary")
             ui.button(
@@ -187,23 +204,39 @@ def _build_schedule_card(schedule: ScheduleRecord, *, on_refresh, schemas: dict[
 def _build_pipeline_config_section(
     pipeline_name: str,
     existing_settings: dict[str, Any] | None = None,
+    existing_template_variables: dict[str, str] | None = None,
+    *,
+    schemas: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the pipeline configuration section with preset selection and
     manual configuration via the schema-driven form.
 
+    Args:
+        schemas: The merged built-in + user-pipeline schema dict (from
+            ``get_all_schemas_with_user_pipelines``). Previously this
+            function always called the built-in-only ``get_all_schemas()``,
+            so selecting a user-defined pipeline ("user:<id>") always
+            rendered "No configurable parameters" even though the pipeline
+            dropdown itself listed user pipelines (WG-28). Callers should
+            fetch the merged schemas once and pass them in here.
+
     Returns a dict with:
         - 'get_settings': callable that returns the current pipeline_settings
+        - 'get_template_variables': callable that returns the variable
+          definitions to resolve at fire time (non-empty only when a preset
+          carrying variables is selected)
         - 'container': the UI container element
     """
-    schemas = pipelines_service.get_all_schemas()
+    if schemas is None:
+        schemas = pipelines_service.get_all_schemas()
     schema_info = schemas.get(pipeline_name, {})
     schema_tree = schema_info.get("schema", [])
-    is_user_pipeline = schema_info.get("is_user_pipeline", False)
 
     # State for collecting form values
     current_sections: list[dict[str, Any]] = []
     config_mode = {"value": "preset"}  # 'preset' or 'manual'
     preset_settings: dict[str, Any] = {}
+    preset_template_variables: dict[str, str] = dict(existing_template_variables or {})
 
     ui.label("Pipeline Configuration").classes(
         "text-subtitle2 text-weight-medium q-mt-md"
@@ -242,6 +275,10 @@ def _build_pipeline_config_section(
                 if selected:
                     preset_settings.clear()
                     preset_settings.update(selected["pipeline_settings"])
+                    preset_template_variables.clear()
+                    preset_template_variables.update(
+                        selected.get("template_variables") or {}
+                    )
 
             select = ui.select(
                 options=options,
@@ -256,6 +293,9 @@ def _build_pipeline_config_section(
                     if p["pipeline_settings"] == existing_settings:
                         select.value = p["id"]
                         preset_settings.update(p["pipeline_settings"])
+                        preset_template_variables.update(
+                            p.get("template_variables") or {}
+                        )
                         break
 
     def build_manual_section() -> None:
@@ -302,8 +342,20 @@ def _build_pipeline_config_section(
         else:
             return _collect_values(current_sections)
 
+    def get_template_variables() -> dict[str, str]:
+        """Return the template variable definitions to persist on the schedule.
+
+        Only meaningful in preset mode (manual configuration has no
+        placeholders to resolve, since the form always collects concrete
+        values).
+        """
+        if config_mode["value"] == "preset":
+            return dict(preset_template_variables)
+        return {}
+
     return {
         "get_settings": get_settings,
+        "get_template_variables": get_template_variables,
         "rebuild_presets": build_preset_section,
         "rebuild_manual": build_manual_section,
     }
@@ -341,10 +393,10 @@ async def _open_create_dialog(*, on_refresh) -> None:
         ).classes("w-full").props("outlined dense")
 
         # Cron expression
-        ui.label("Schedule").classes("text-subtitle2 text-weight-medium q-mt-md")
+        ui.label("Schedule (UTC)").classes("text-subtitle2 text-weight-medium q-mt-md")
         with ui.row().classes("w-full items-end gap-2"):
             cron_input = ui.input(
-                label="Cron Expression (min hour dom month dow)",
+                label="Cron Expression, UTC (min hour dom month dow)",
                 placeholder="0 1 * * *",
                 value="0 1 * * *",
             ).classes("w-full").props("outlined dense")
@@ -392,6 +444,7 @@ async def _open_create_dialog(*, on_refresh) -> None:
             with config_section_container:
                 result = _build_pipeline_config_section(
                     pipeline_select.value or first_pipeline,
+                    schemas=schemas,
                 )
                 config_ref.clear()
                 config_ref.update(result)
@@ -408,25 +461,36 @@ async def _open_create_dialog(*, on_refresh) -> None:
         error_label.set_visibility(False)
 
         async def do_create() -> None:
-            pipeline_settings = config_ref["get_settings"]() if config_ref else {}
+            # Guard against double-submit (WG-23).
+            if create_btn.props.get("disable"):
+                return
+            create_btn.props("disable loading")
             try:
-                await scheduler_service.create_schedule(
-                    name=name_input.value or "",
-                    pipeline=pipeline_select.value or "",
-                    pipeline_settings=pipeline_settings,
-                    cron_expression=cron_input.value or "",
-                    enabled=True,
+                pipeline_settings = config_ref["get_settings"]() if config_ref else {}
+                template_variables = (
+                    config_ref["get_template_variables"]() if config_ref else {}
                 )
-                ui.notify("Schedule created", type="positive")
-                dlg.close()
-                await on_refresh()
-            except ValueError as exc:
-                error_label.text = str(exc)
-                error_label.set_visibility(True)
+                try:
+                    await scheduler_service.create_schedule(
+                        name=name_input.value or "",
+                        pipeline=pipeline_select.value or "",
+                        pipeline_settings=pipeline_settings,
+                        cron_expression=cron_input.value or "",
+                        enabled=True,
+                        template_variables=template_variables,
+                    )
+                    ui.notify("Schedule created", type="positive")
+                    dlg.close()
+                    await on_refresh()
+                except ValueError as exc:
+                    error_label.text = str(exc)
+                    error_label.set_visibility(True)
+            finally:
+                create_btn.props(remove="disable loading")
 
         with ui.row().classes("w-full justify-end gap-2 q-mt-md"):
             ui.button("Cancel", on_click=dlg.close).props("flat")
-            ui.button("Create", on_click=do_create).props("color=primary")
+            create_btn = ui.button("Create", on_click=do_create).props("color=primary")
 
     dlg.open()
 
@@ -458,9 +522,9 @@ async def _open_edit_dialog(schedule_id: str, *, on_refresh) -> None:
         ).classes("w-full").props("outlined dense")
 
         # Cron expression
-        ui.label("Schedule").classes("text-subtitle2 text-weight-medium q-mt-md")
+        ui.label("Schedule (UTC)").classes("text-subtitle2 text-weight-medium q-mt-md")
         cron_input = ui.input(
-            label="Cron Expression (min hour dom month dow)",
+            label="Cron Expression, UTC (min hour dom month dow)",
             value=schedule.cron_expression,
         ).classes("w-full").props("outlined dense")
 
@@ -508,10 +572,17 @@ async def _open_edit_dialog(schedule_id: str, *, on_refresh) -> None:
                 if pipeline_select.value == schedule.pipeline
                 else None
             )
+            existing_vars = (
+                schedule.template_variables
+                if pipeline_select.value == schedule.pipeline
+                else None
+            )
             with config_section_container:
                 result = _build_pipeline_config_section(
                     pipeline_select.value or schedule.pipeline,
                     existing_settings=existing,
+                    existing_template_variables=existing_vars,
+                    schemas=schemas,
                 )
                 config_ref.clear()
                 config_ref.update(result)
@@ -530,26 +601,37 @@ async def _open_edit_dialog(schedule_id: str, *, on_refresh) -> None:
         error_label.set_visibility(False)
 
         async def do_save() -> None:
-            pipeline_settings = config_ref["get_settings"]() if config_ref else {}
+            # Guard against double-submit (WG-23).
+            if save_btn.props.get("disable"):
+                return
+            save_btn.props("disable loading")
             try:
-                await scheduler_service.update_schedule(
-                    schedule_id,
-                    name=name_input.value,
-                    pipeline=pipeline_select.value,
-                    pipeline_settings=pipeline_settings,
-                    cron_expression=cron_input.value,
-                    enabled=enabled_switch.value,
+                pipeline_settings = config_ref["get_settings"]() if config_ref else {}
+                template_variables = (
+                    config_ref["get_template_variables"]() if config_ref else {}
                 )
-                ui.notify("Schedule updated", type="positive")
-                dlg.close()
-                await on_refresh()
-            except ValueError as exc:
-                error_label.text = str(exc)
-                error_label.set_visibility(True)
+                try:
+                    await scheduler_service.update_schedule(
+                        schedule_id,
+                        name=name_input.value,
+                        pipeline=pipeline_select.value,
+                        pipeline_settings=pipeline_settings,
+                        cron_expression=cron_input.value,
+                        enabled=enabled_switch.value,
+                        template_variables=template_variables,
+                    )
+                    ui.notify("Schedule updated", type="positive")
+                    dlg.close()
+                    await on_refresh()
+                except ValueError as exc:
+                    error_label.text = str(exc)
+                    error_label.set_visibility(True)
+            finally:
+                save_btn.props(remove="disable loading")
 
         with ui.row().classes("w-full justify-end gap-2 q-mt-md"):
             ui.button("Cancel", on_click=dlg.close).props("flat")
-            ui.button("Save", on_click=do_save).props("color=primary")
+            save_btn = ui.button("Save", on_click=do_save).props("color=primary")
 
     dlg.open()
 
@@ -615,7 +697,8 @@ async def schedules_page() -> None:
 
             ui.label(
                 "Configure pipelines to run automatically on a cron schedule. "
-                "Use standard cron expressions (minute hour day month weekday)."
+                "Use standard cron expressions (minute hour day month weekday). "
+                "All times are UTC."
             ).classes("text-caption text-grey")
 
             if not schedules:

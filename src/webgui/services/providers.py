@@ -31,12 +31,7 @@ from smart_albums.core.node import ConfigParam
 from protocols_system import ProtocolsRegistry
 from protocols_system.protocols import (
     ICache,
-    ICacheManager,
-    IEmbeddingClient,
-    IGeoClient,
     IHealthCheck,
-    IImageClient,
-    ILLMClient,
     IProgressReporter,
 )
 

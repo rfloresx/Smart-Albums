@@ -28,7 +28,10 @@ class PartitionFaiss(Stage):
             key="threshold",
             type=float,
             default=0.95,
-            description="Minimum cosine similarity to group assets as near-duplicates.",
+            min=-1.0,
+            max=1.0,
+            description="Minimum cosine similarity to group assets as near-duplicates. "
+            "Cosine similarity is defined on [-1.0, 1.0] (ND-15).",
         ),
     )
 
@@ -41,13 +44,21 @@ class PartitionFaiss(Stage):
         with_emb = [a for a in ctx.assets if a.metadata.get("embedding")]
         without_emb = [a for a in ctx.assets if not a.metadata.get("embedding")]
 
-        if len(with_emb) < 2:
-            return [ctx]
+        # Only run similarity grouping when there are at least 2 embedded
+        # assets. With fewer than 2, there's no basis to group anything —
+        # emit singleton partitions instead of returning the whole (unsplit)
+        # context. Returning [ctx] here previously meant that if embedding
+        # mostly failed upstream (leaving 0-1 assets with a vector), the
+        # entire pool would flow downstream as a single "duplicate group"
+        # and a select stage would reduce it to one asset, silently
+        # discarding everything else.
+        if len(with_emb) >= 2:
+            groups = group_by_embedding_similarity(with_emb, threshold)
+            partitions = list(groups.values())
+        else:
+            groups = {}
+            partitions = [[a] for a in with_emb]
 
-        # Build FAISS index and form transitive groups
-        groups = group_by_embedding_similarity(with_emb, threshold)
-
-        partitions = list(groups.values())
         for asset in without_emb:
             partitions.append([asset])
 

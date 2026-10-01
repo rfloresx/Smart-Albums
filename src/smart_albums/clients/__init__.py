@@ -8,6 +8,7 @@ from smart_albums.clients.huggingface_embedding import HuggingFaceEmbeddingClien
 from smart_albums.clients.image_embedding import ImageEmbeddingClient
 from smart_albums.clients.immich import ImmichClient
 from smart_albums.clients.llamacpp import LlamaCppClient
+from smart_albums.clients.local import LocalImageClient
 from smart_albums.clients.ollama import OllamaClient
 from smart_albums.clients.openai_llm import OpenAIClient
 
@@ -17,6 +18,7 @@ __all__ = [
     "ImageEmbeddingClient",
     "ImmichClient",
     "LlamaCppClient",
+    "LocalImageClient",
     "OllamaClient",
     "OllamaEmbeddingClient",
     "OpenAIClient",

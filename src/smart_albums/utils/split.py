@@ -53,6 +53,15 @@ def split_contexts(
             config=ctx.config,
             assets=copy.deepcopy(assets),
             stats={},
+            # Copy (not share) the parent's metadata so each child can be
+            # mutated independently, but don't drop it. Fork sets
+            # metadata["branch"] on branch contexts (see fork/fork.py); if a
+            # partition/merge composite runs inside a branch and this were
+            # left empty, that tag — and anything else attached upstream —
+            # would silently disappear as soon as the composite's merge
+            # stage ran, since merge_concat carries over the first child's
+            # metadata.
+            metadata=dict(ctx.metadata),
             partition_name=partition_name,
             partition_id=child_id,
             parent_partition_id=parent_id,

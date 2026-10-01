@@ -96,7 +96,77 @@ class TestAnalyzeScore:
         result = await node.run(ctx)
         assert result[0].assets[0].metadata["score"] == 0.0
         assert result[0].assets[0].metadata["error"] == "model timeout"
+        assert result[0].assets[0].metadata["vision_error"] == "model timeout"
+        # An LLM-reported error is a failure, not a successful computation:
+        # it must not be counted as "computed" (which downstream reporting
+        # treats as a real score), and it must not be silently swallowed by
+        # a later min_score filter without ever showing up in failure stats.
+        assert result[0].stats["analyze.score.computed"] == 0
+        assert result[0].stats["analyze.score.failures"] == 1
+
+    @pytest.mark.asyncio
+    async def test_score_out_of_range_is_clamped(self, prompt_file: str):
+        client = FakeImageClient()
+        llm = FakeLLMClient(response={"score": 8.5, "is_screenshot": False})
+        assets = [make_asset(id="a1")]
+        ctx = make_context(assets=assets, image_client=client, llm_client=llm)
+        node = AnalyzeScore({"prompt_file": prompt_file})
+        result = await node.run(ctx)
+        # A model answering on a 0-10 scale must not silently break every
+        # downstream stage that assumes scores are in [0, 1] (min_score's
+        # threshold, select.best's weighting, ...).
+        assert result[0].assets[0].metadata["score"] == 1.0
         assert result[0].stats["analyze.score.computed"] == 1
+
+    @pytest.mark.asyncio
+    async def test_non_numeric_score_is_a_failure(self, prompt_file: str):
+        client = FakeImageClient()
+        llm = FakeLLMClient(response={"score": "not-a-number", "is_screenshot": False})
+        assets = [make_asset(id="a1")]
+        ctx = make_context(assets=assets, image_client=client, llm_client=llm)
+        node = AnalyzeScore({"prompt_file": prompt_file})
+        result = await node.run(ctx)
+        assert result[0].stats["analyze.score.failures"] == 1
+        assert result[0].stats["analyze.score.computed"] == 0
+        assert "error" in result[0].assets[0].metadata
+
+    @pytest.mark.asyncio
+    async def test_non_dict_llm_result_is_a_failure_not_a_crash(self, prompt_file: str):
+        client = FakeImageClient()
+        llm = FakeLLMClient()
+        llm._response = ["unexpected", "list"]  # type: ignore[assignment]
+        assets = [make_asset(id="a1"), make_asset(id="a2")]
+        ctx = make_context(assets=assets, image_client=client, llm_client=llm)
+        node = AnalyzeScore({"prompt_file": prompt_file})
+        # A malformed (non-dict) LLM response must be recorded as a
+        # per-asset failure, not propagate out of asyncio.gather() and take
+        # down the whole stage (which would also lose the second asset's
+        # result and skip progress.finish_stage()/the stats update).
+        result = await node.run(ctx)
+        assert result[0].stats["analyze.score.failures"] == 2
+        assert result[0].stats["analyze.score.computed"] == 0
+
+    @pytest.mark.asyncio
+    async def test_cache_hit_clears_stale_error(self, prompt_file: str):
+        import hashlib
+
+        with open(prompt_file, "r") as f:
+            prompt_content = f.read()
+        prompt_hash = hashlib.sha256(prompt_content.encode()).hexdigest()[:8]
+        cache_key = f"a1:{prompt_hash}"
+        cache_data = {cache_key: {"score": 0.9, "is_screenshot": False}}
+        cache_manager = _FakeCacheManager(cache_data)
+
+        client = FakeImageClient()
+        llm = FakeLLMClient(response={"score": 0.1, "is_screenshot": True})
+        # Simulate a stale error left over from a previous failed run.
+        assets = [make_asset(id="a1", metadata={"error": "old failure", "vision_error": "old failure"})]
+        ctx = make_context(assets=assets, image_client=client, llm_client=llm, cache_manager=cache_manager)
+        node = AnalyzeScore({"prompt_file": prompt_file})
+        result = await node.run(ctx)
+        assert result[0].assets[0].metadata["score"] == 0.9
+        assert "error" not in result[0].assets[0].metadata
+        assert "vision_error" not in result[0].assets[0].metadata
 
     @pytest.mark.asyncio
     async def test_thumbnail_exception_records_failure(self, prompt_file: str):

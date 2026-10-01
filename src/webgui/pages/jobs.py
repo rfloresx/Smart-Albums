@@ -8,6 +8,7 @@ data offer a download button.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import zipfile
 from datetime import datetime
@@ -104,19 +105,23 @@ async def download_export(job_id: str) -> Response:
     # Check if a pre-built ZIP exists in the export directory root
     existing_zips = list(export_dir.glob("*.zip"))
     if existing_zips:
-        # Serve the first ZIP found directly
+        # Serve the first ZIP found directly. read_bytes() off-thread since
+        # a pre-built export zip has no size cap (unlike the on-the-fly
+        # path below) and could be large (WG-21).
         zip_path = existing_zips[0]
         return Response(
-            content=zip_path.read_bytes(),
+            content=await asyncio.to_thread(zip_path.read_bytes),
             media_type="application/zip",
             headers={
                 "Content-Disposition": f'attachment; filename="{zip_path.name}"'
             },
         )
 
-    # Create ZIP on-the-fly
+    # Create ZIP on-the-fly. Zipping can take a while for a large export
+    # directory; run it in a thread so it doesn't block the event loop (and
+    # every other connected client) for the duration (WG-21).
     try:
-        zip_bytes = _create_export_zip(export_dir)
+        zip_bytes = await asyncio.to_thread(_create_export_zip, export_dir)
     except ValueError as exc:
         return Response(content=str(exc), status_code=413)
 
@@ -151,7 +156,7 @@ async def download_logs(job_id: str) -> Response:
         return Response(content="No log data available for this job", status_code=404)
 
     return Response(
-        content=log_file.read_bytes(),
+        content=await asyncio.to_thread(log_file.read_bytes),
         media_type="text/plain",
         headers={
             "Content-Disposition": f'attachment; filename="job-{job_id}.log"'
@@ -204,12 +209,17 @@ def _build_job_card(job, *, on_refresh) -> dict:
         )
         refs["error_label"].set_visibility(bool(job.error))
 
-        # Log output (expandable)
+        # Log output (expandable). Rendered as plain text via a <pre> element
+        # rather than ui.code(), which pipes its content through
+        # ui.markdown() with no sanitizer in NiceGUI 2.x. Log lines can
+        # contain attacker-influenceable text (filenames, LLM output,
+        # exception messages) that would otherwise let a closing ``` fence
+        # followed by raw HTML execute in every viewer's browser.
         if job.log_output:
             with ui.expansion("Log output").classes("w-full q-mt-sm").props("dense"):
-                ui.code(job.log_output[-4000:]).classes(
-                    "w-full text-xs"
-                ).style("max-height: 300px; overflow-y: auto;")
+                ui.label(job.log_output[-4000:]).classes(
+                    "w-full text-xs font-mono whitespace-pre-wrap break-words"
+                ).style("max-height: 300px; overflow-y: auto; display: block;")
 
         # Actions
         with ui.row().classes("w-full justify-end gap-2 q-mt-sm") as actions_row:
@@ -248,7 +258,7 @@ def _render_actions(container, job, *, on_refresh) -> None:
     """Render action buttons inside the given container."""
     container.clear()
     with container:
-        if job.status == JobStatus.running:
+        if job.status in (JobStatus.running, JobStatus.pending):
             async def do_cancel(jid=job.id) -> None:
                 try:
                     await jobs_service.cancel_job(jid)
@@ -301,11 +311,16 @@ async def jobs_page() -> None:
     # Track card refs by job ID for surgical updates
     card_refs: dict[int, dict] = {}
 
+    # Cap the history shown/polled per page load. Without this, both the
+    # initial render and every 3s poll loaded the *entire* job history
+    # (every job this server has ever run) on every open tab (WG-21).
+    _JOB_LIST_LIMIT = 100
+
     async def full_refresh() -> None:
         """Full rebuild of the job list (used on status changes, delete, etc.)."""
         container.clear()
         card_refs.clear()
-        jobs = await jobs_service.list_jobs()
+        jobs = await jobs_service.list_jobs(limit=_JOB_LIST_LIMIT)
         with container:
             if not jobs:
                 ui.label("No jobs yet — start one from the New Job page.").classes(
@@ -319,8 +334,16 @@ async def jobs_page() -> None:
     await full_refresh()
 
     async def poll() -> None:
-        """Poll for updates — only re-render changed parts."""
-        jobs = await jobs_service.list_jobs()
+        """Poll for updates — only re-render changed parts.
+
+        Uses list_job_summaries (no log_output column) since this runs
+        every 3 seconds for every open tab and only needs status/progress
+        to decide what to redraw — not the full log text of every job in
+        history on every tick (WG-21). Running jobs are still overlaid from
+        state.running_jobs, which does carry the in-memory log tail, so the
+        "Logs" expansion isn't affected once a card is actually rebuilt.
+        """
+        jobs = await jobs_service.list_job_summaries(limit=_JOB_LIST_LIMIT)
         has_running = any(j.status == JobStatus.running for j in jobs)
         if not has_running and not any(
             r["status"] == JobStatus.running for r in card_refs.values()

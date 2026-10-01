@@ -61,14 +61,35 @@ class TestUnionFindPHash:
         groups = _union_find_phash([a1, a2], threshold=0.90)
         assert len(groups) == 2
 
-    def test_transitive_grouping(self):
+    def test_transitive_grouping_when_all_pairs_match(self):
         # threshold=0.90 → max_distance = int(0.10 * 64) = 6
-        # a1→a2 dist=4 (≤6 ✓), a2→a3 dist=4 (≤6 ✓), transitively grouped
+        # All three pairs are mutually within max_distance — grouping all
+        # three together is correct here since every pair genuinely
+        # qualifies, including against the anchor.
+        a1 = make_asset(id="a1", metadata={"phash": "0000000000000000"})
+        a2 = make_asset(id="a2", metadata={"phash": "0000000000000001"})  # dist 1 from a1
+        a3 = make_asset(id="a3", metadata={"phash": "0000000000000003"})  # dist 2 from a1, dist 1 from a2
+        groups = _union_find_phash([a1, a2, a3], threshold=0.90)
+        assert len(groups) == 1
+
+    def test_anchor_bound_prevents_unbounded_chain(self):
+        # threshold=0.90 → max_distance = int(0.10 * 64) = 6
+        # a1-a2 dist=4 (within threshold), a2-a3 dist=4 (within threshold),
+        # but a1-a3 dist=8 (NOT within threshold). Plain single-linkage
+        # union-find would chain a1-a2-a3 into one group purely because
+        # each is close to its immediate neighbor, even though a1 and a3
+        # are not actually similar — this is exactly the "long chain
+        # collapses into one giant group" failure mode described in
+        # ND-10. The anchor-bounded union-find requires a3 to also match
+        # the group's anchor (a1) before joining, so it must form its own
+        # separate group instead.
         a1 = make_asset(id="a1", metadata={"phash": "0000000000000000"})
         a2 = make_asset(id="a2", metadata={"phash": "000000000000000f"})  # dist 4 from a1
         a3 = make_asset(id="a3", metadata={"phash": "00000000000000ff"})  # dist 4 from a2, 8 from a1
         groups = _union_find_phash([a1, a2, a3], threshold=0.90)
-        assert len(groups) == 1
+        assert len(groups) == 2
+        sizes = sorted(len(g) for g in groups.values())
+        assert sizes == [1, 2]
 
     def test_threshold_boundary(self):
         # threshold=0.90 → max_distance = 6

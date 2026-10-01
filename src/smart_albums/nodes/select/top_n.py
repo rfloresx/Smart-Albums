@@ -11,7 +11,6 @@ tie-breaker. Assets without a score are ranked last.
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 from smart_albums.core.context import ContextBatch, PipelineContext
 from protocols_system.protocols import Asset

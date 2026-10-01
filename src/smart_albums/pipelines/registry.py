@@ -7,7 +7,7 @@ and factory functions for retrieving them at runtime.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 from smart_albums.core.spec import Pipeline
 

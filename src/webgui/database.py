@@ -61,6 +61,7 @@ CREATE TABLE IF NOT EXISTS schedules (
     name TEXT NOT NULL,
     pipeline TEXT NOT NULL,
     pipeline_settings TEXT NOT NULL DEFAULT '{}',
+    template_variables TEXT NOT NULL DEFAULT '{}',
     cron_expression TEXT NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
@@ -118,11 +119,40 @@ class Database:
             )
             logger.info("Migration: added template_variables column to presets")
 
+        # Same column on schedules (WG-19): a schedule configured from a
+        # preset needs to carry that preset's template variable
+        # definitions so they can be resolved at fire time, not just at
+        # initial preset-selection time in the UI.
+        cursor = await self._db.execute("PRAGMA table_info(schedules)")
+        schedule_columns = {row[1] for row in await cursor.fetchall()}
+        if "template_variables" not in schedule_columns:
+            await self._db.execute(
+                "ALTER TABLE schedules ADD COLUMN template_variables TEXT NOT NULL DEFAULT '{}'"
+            )
+            logger.info("Migration: added template_variables column to schedules")
+
     async def close(self) -> None:
         """Close the database connection."""
         if self._db:
             await self._db.close()
             self._db = None
+
+    async def backup_to(self, dest_path: str) -> None:
+        """Write a consistent snapshot of this database to ``dest_path``.
+
+        Uses SQLite's online backup API rather than copying the underlying
+        file, so it produces a correct snapshot even while the database is
+        open in WAL mode with pending, not-yet-checkpointed writes in the
+        ``-wal`` file (a plain file copy of ``self._db_path`` would miss
+        those). Safe to call while the connection is in normal use.
+        """
+        assert self._db is not None
+        Path(dest_path).parent.mkdir(parents=True, exist_ok=True)
+        dest_conn = await aiosqlite.connect(dest_path)
+        try:
+            await self._db.backup(dest_conn)
+        finally:
+            await dest_conn.close()
 
     # ------------------------------------------------------------------
     # Users
@@ -221,14 +251,66 @@ class Database:
             return None
         return self._row_to_job(row)
 
-    async def list_jobs(self) -> list[JobRecord]:
-        """List all jobs, most recent first."""
+    async def list_jobs(self, *, limit: Optional[int] = None) -> list[JobRecord]:
+        """List all jobs, most recent first.
+
+        Args:
+            limit: If given, return at most this many jobs (still most
+                recent first). The Jobs page polls this every 3 seconds for
+                every open tab; without a limit, every poll loads the full
+                history including each job's complete ``log_output`` (up to
+                2000 lines each), which only grows over time (WG-21).
+        """
         assert self._db is not None
-        cursor = await self._db.execute(
-            "SELECT * FROM jobs ORDER BY created_at DESC"
-        )
+        if limit is not None:
+            cursor = await self._db.execute(
+                "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,)
+            )
+        else:
+            cursor = await self._db.execute(
+                "SELECT * FROM jobs ORDER BY created_at DESC"
+            )
         rows = await cursor.fetchall()
         return [self._row_to_job(row) for row in rows]
+
+    async def list_job_summaries(self, *, limit: Optional[int] = None) -> list[JobRecord]:
+        """List jobs without their ``log_output`` column.
+
+        Used by the Jobs page's polling loop, which only needs status/
+        timing/progress to decide whether to re-render — not the full log
+        text of every job on every tick. ``log_output`` is set to ``""`` on
+        the returned records; callers that need the real log should fetch
+        the specific job via :meth:`get_job`.
+        """
+        assert self._db is not None
+        query = (
+            "SELECT id, pipeline, pipeline_settings, status, created_at, "
+            "started_at, completed_at, error FROM jobs ORDER BY created_at DESC"
+        )
+        if limit is not None:
+            query += " LIMIT ?"
+            cursor = await self._db.execute(query, (limit,))
+        else:
+            cursor = await self._db.execute(query)
+        rows = await cursor.fetchall()
+        return [
+            JobRecord(
+                id=row["id"],
+                pipeline=row["pipeline"],
+                pipeline_settings=json.loads(row["pipeline_settings"]),
+                status=JobStatus(row["status"]),
+                created_at=datetime.fromisoformat(row["created_at"]),
+                started_at=(
+                    datetime.fromisoformat(row["started_at"]) if row["started_at"] else None
+                ),
+                completed_at=(
+                    datetime.fromisoformat(row["completed_at"]) if row["completed_at"] else None
+                ),
+                error=row["error"],
+                log_output="",
+            )
+            for row in rows
+        ]
 
     async def delete_job(self, job_id: str) -> bool:
         """Delete a job record. Returns True if deleted."""
@@ -398,14 +480,15 @@ class Database:
         assert self._db is not None
         await self._db.execute(
             """INSERT INTO schedules
-               (id, name, pipeline, pipeline_settings, cron_expression,
+               (id, name, pipeline, pipeline_settings, template_variables, cron_expression,
                 enabled, created_at, updated_at, last_run_at, next_run_at, last_job_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 record.id,
                 record.name,
                 record.pipeline,
                 json.dumps(record.pipeline_settings),
+                json.dumps(record.template_variables),
                 record.cron_expression,
                 1 if record.enabled else 0,
                 record.created_at.isoformat(),
@@ -418,18 +501,55 @@ class Database:
         await self._db.commit()
 
     async def update_schedule(self, record: ScheduleRecord) -> None:
-        """Update an existing schedule record."""
+        """Update an existing schedule record (all user-editable + scheduler columns).
+
+        Intended for user-initiated edits (the schedules page's edit
+        dialog), which legitimately want to overwrite every column. The
+        background scheduler loop should use ``update_schedule_fields``
+        instead, which only touches the columns it owns.
+        """
         assert self._db is not None
         await self._db.execute(
             """UPDATE schedules SET name=?, pipeline=?, pipeline_settings=?,
-               cron_expression=?, enabled=?, updated_at=?,
+               template_variables=?, cron_expression=?, enabled=?, updated_at=?,
                last_run_at=?, next_run_at=?, last_job_id=?
                WHERE id=?""",
             (
                 record.name,
                 record.pipeline,
                 json.dumps(record.pipeline_settings),
+                json.dumps(record.template_variables),
                 record.cron_expression,
+                1 if record.enabled else 0,
+                record.updated_at.isoformat(),
+                record.last_run_at.isoformat() if record.last_run_at else None,
+                record.next_run_at.isoformat() if record.next_run_at else None,
+                record.last_job_id,
+                record.id,
+            ),
+        )
+        await self._db.commit()
+
+    async def update_schedule_fields(self, record: ScheduleRecord) -> None:
+        """Update only the columns the background scheduler owns.
+
+        Writes ``enabled``, ``last_run_at``, ``next_run_at``, ``last_job_id``,
+        and ``updated_at`` — never ``name``, ``pipeline``, ``pipeline_settings``,
+        or ``cron_expression``. The scheduler loop (``services/scheduler.py``)
+        reads a schedule, decides when it next fires, and must write that
+        decision back without clobbering a concurrent user edit (made via
+        the UI's edit dialog, which calls ``update_schedule`` instead) to
+        any of the user-owned fields. Also only disables (never re-enables)
+        a schedule, so the scheduler can turn off a schedule whose cron
+        expression can no longer produce a next run, without ever
+        overriding a user who paused it independently.
+        """
+        assert self._db is not None
+        await self._db.execute(
+            """UPDATE schedules SET enabled=CASE WHEN ?=0 THEN 0 ELSE enabled END,
+               updated_at=?, last_run_at=?, next_run_at=?, last_job_id=?
+               WHERE id=?""",
+            (
                 1 if record.enabled else 0,
                 record.updated_at.isoformat(),
                 record.last_run_at.isoformat() if record.last_run_at else None,
@@ -486,6 +606,11 @@ class Database:
             name=row["name"],
             pipeline=row["pipeline"],
             pipeline_settings=json.loads(row["pipeline_settings"]),
+            template_variables=(
+                json.loads(row["template_variables"])
+                if "template_variables" in row.keys() and row["template_variables"]
+                else {}
+            ),
             cron_expression=row["cron_expression"],
             enabled=bool(row["enabled"]),
             created_at=datetime.fromisoformat(row["created_at"]),

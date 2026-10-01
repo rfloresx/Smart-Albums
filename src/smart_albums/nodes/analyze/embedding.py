@@ -1,15 +1,15 @@
 """analyze.embedding — compute and cache vector embeddings for each asset.
 
-Two execution paths are supported depending on the embedding client:
+``embed_batch()`` is a required method on ``IEmbeddingClient``, so this
+stage always uses the batch path: uncached assets are fetched concurrently
+(bounded by ``concurrency``), then handed to the client in chunks of
+``batch_size`` so the model can process them in batched forward passes.
 
-* **Batch path** (preferred): used when the client exposes ``embed_batch()``.
-  Uncached assets are fetched concurrently, then handed to the client as a
-  single list so the model can process them in batched forward passes. This
-  is significantly faster on GPU than the per-asset path.
-
-* **Per-asset path** (fallback): used when the client only implements
-  ``embed()``. Assets are processed concurrently up to ``concurrency``
-  at a time, each triggering an individual forward pass.
+(Historically a per-asset fallback using ``embed()`` existed, but since
+``embed_batch`` became mandatory it was never reachable and the docstring
+that advertised it was stale — ND-18. It has been removed; a client that
+can only embed one image at a time should implement ``embed_batch`` as a
+thin loop over ``embed``.)
 """
 
 from __future__ import annotations
@@ -203,10 +203,19 @@ class AnalyzeEmbedding(Stage):
                 failed_fetch.add(asset_id)
                 failures += 1
 
-        # Mark fetch failures on assets
-        id_to_asset = {a.id: a for a in uncached_assets}
+        # Map each id to *all* assets that share it. A context can legitimately
+        # contain more than one Asset object with the same id (e.g. the same
+        # photo pulled in by two retrieve sources), and a plain
+        # ``{a.id: a}`` dict kept only the last one — so every other object
+        # with that id never received its embedding and looked like a failure
+        # downstream (ND-18). Assigning to all of them keeps duplicates
+        # consistent.
+        id_to_assets: dict[str, list[Any]] = {}
+        for a in uncached_assets:
+            id_to_assets.setdefault(a.id, []).append(a)
         for asset_id in failed_fetch:
-            id_to_asset[asset_id].metadata["error"] = "thumbnail fetch failed"
+            for a in id_to_assets[asset_id]:
+                a.metadata["error"] = "thumbnail fetch failed"
 
         logger.debug(
             "Batch path phase 2 done: %d valid thumbnails, %d fetch failures",
@@ -245,20 +254,39 @@ class AnalyzeEmbedding(Stage):
                     exc,
                 )
                 for asset_id in chunk_ids:
-                    id_to_asset[asset_id].metadata["error"] = str(exc)
+                    for a in id_to_assets[asset_id]:
+                        a.metadata["error"] = str(exc)
                     failures += 1
                 continue
+
+            # A well-behaved client returns exactly one entry per input
+            # image. If it returns fewer, ``zip`` would silently truncate
+            # and the trailing assets would be left with neither an
+            # embedding nor an error (ND-18) — treat the shortfall as a
+            # per-asset failure instead of dropping it on the floor.
+            if len(embeddings) != len(chunk_ids):
+                logger.warning(
+                    "embed_batch returned %d vectors for %d images at index %d; "
+                    "treating the mismatch as failures for the unmatched assets",
+                    len(embeddings), len(chunk_ids), chunk_start,
+                )
+                for asset_id in chunk_ids[len(embeddings):]:
+                    for a in id_to_assets[asset_id]:
+                        a.metadata["error"] = "embedding missing from batch result"
+                    failures += 1
 
             for asset_id, embedding in zip(chunk_ids, embeddings):
                 if embedding is None:
                     logger.warning(
                         "embed_batch returned None for asset %s", asset_id
                     )
-                    id_to_asset[asset_id].metadata["error"] = "embedding decode failed"
+                    for a in id_to_assets[asset_id]:
+                        a.metadata["error"] = "embedding decode failed"
                     failures += 1
                     continue
 
-                id_to_asset[asset_id].metadata["embedding"] = embedding
+                for a in id_to_assets[asset_id]:
+                    a.metadata["embedding"] = embedding
                 computed += 1
                 logger.debug(
                     "Embedded asset %s: vector dim=%d", asset_id, len(embedding)
@@ -272,92 +300,6 @@ class AnalyzeEmbedding(Stage):
             computed, cached_count, failures,
         )
         _write_stats(ctx, computed, cached_count, failures)
-
-    # ------------------------------------------------------------------
-    # Per-asset fallback path
-    # ------------------------------------------------------------------
-
-    async def _run_sequential(
-        self,
-        ctx: PipelineContext,
-        model: str,
-        concurrency: int,
-        cache: Any,
-    ) -> None:
-        """Per-asset execution path using embed() with a concurrency semaphore.
-
-        Args:
-            ctx: The pipeline context whose assets will be mutated.
-            model: Cache key string.
-            concurrency: Max concurrent embed() calls.
-            cache: Optional cache instance.
-        """
-        image_client = ProtocolsRegistry.get_instance(IImageClient)
-        embedding_client = ProtocolsRegistry.get_instance(IEmbeddingClient)
-
-        semaphore = asyncio.Semaphore(concurrency)
-        computed = 0
-        cached_count = 0
-        failures = 0
-        lock = asyncio.Lock()
-
-        async def _process(asset: Any) -> None:
-            nonlocal computed, cached_count, failures
-            cache_key = (asset.id, model)
-            async with semaphore:
-                if cache is not None:
-                    cached_emb = cache.get(cache_key)
-                    if cached_emb is not None:
-                        logger.debug("Sequential path cache HIT for asset %s", asset.id)
-                        asset.metadata["embedding"] = cached_emb
-                        async with lock:
-                            cached_count += 1
-                        return
-
-                try:
-                    logger.debug("Sequential path: fetching thumbnail for asset %s", asset.id)
-                    if image_client is None:
-                        raise RuntimeError("image_client is required for stage 'analyze.embedding'")
-                    image_bytes = await image_client.get_asset_thumbnail(asset.id)
-                    logger.debug(
-                        "Sequential path: embedding asset %s (%d bytes)",
-                        asset.id, len(image_bytes),
-                    )
-                    if embedding_client is None:
-                        raise RuntimeError("embedding_client is required for stage 'analyze.embedding'")
-                    embedding = await embedding_client.embed(image_bytes)
-                    asset.metadata["embedding"] = embedding
-                    logger.debug(
-                        "Embedded asset %s: vector dim=%d", asset.id, len(embedding)
-                    )
-                    async with lock:
-                        computed += 1
-                    if cache is not None:
-                        cache.put(cache_key, embedding)
-                except FileNotFoundError:
-                    logger.warning(
-                        "Skipping asset %s — media file not found on server.",
-                        asset.id,
-                    )
-                    asset.metadata["error"] = "media not found"
-                    async with lock:
-                        failures += 1
-                except Exception as exc:
-                    logger.warning(
-                        "Embedding failed for asset %s: %s", asset.id, exc
-                    )
-                    asset.metadata["error"] = str(exc)
-                    async with lock:
-                        failures += 1
-
-        await asyncio.gather(*[_process(a) for a in ctx.assets])
-
-        logger.debug(
-            "Sequential path complete: computed=%d, cached=%d, failures=%d",
-            computed, cached_count, failures,
-        )
-        _write_stats(ctx, computed, cached_count, failures)
-
 
 # ---------------------------------------------------------------------------
 # Helpers

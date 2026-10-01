@@ -99,9 +99,16 @@ class _BranchEditor:
                 config = step_data[1] if len(step_data) > 1 else {}
                 alias = step_data[2] if len(step_data) > 2 else ""
 
+                # NOTE: remove/move handlers below collect via
+                # ``_collect_steps_raw`` (not the filtering ``_collect_steps``),
+                # so index `idx` here always matches the editor actually
+                # sitting at UI position `idx` — including steps whose stage
+                # hasn't been picked yet. Using the filtering collector would
+                # silently drop those in-progress steps and make `pop(idx)`
+                # remove the wrong one (WG-26).
                 def make_remove(idx=i):
                     def remove():
-                        current = self._collect_steps()
+                        current = self._collect_steps_raw()
                         current.pop(idx)
                         if not current:
                             current = [["", {}]]
@@ -110,7 +117,7 @@ class _BranchEditor:
 
                 def make_move_up(idx=i):
                     def move_up():
-                        current = self._collect_steps()
+                        current = self._collect_steps_raw()
                         if idx > 0:
                             current[idx - 1], current[idx] = current[idx], current[idx - 1]
                             self._rebuild_steps(current)
@@ -118,7 +125,7 @@ class _BranchEditor:
 
                 def make_move_down(idx=i):
                     def move_down():
-                        current = self._collect_steps()
+                        current = self._collect_steps_raw()
                         if idx < len(current) - 1:
                             current[idx], current[idx + 1] = current[idx + 1], current[idx]
                             self._rebuild_steps(current)
@@ -139,18 +146,36 @@ class _BranchEditor:
 
     def _add_step(self) -> None:
         """Add a new empty step."""
-        current = self._collect_steps()
+        # Raw collection — using the filtering collector here would drop
+        # any other in-progress (stage-not-yet-selected) step every time a
+        # new one is added (WG-26).
+        current = self._collect_steps_raw()
         current.append(["", {}])
         self._rebuild_steps(current)
 
     def _collect_steps(self) -> list[list[Any]]:
-        """Collect steps from editors."""
+        """Collect steps from editors, dropping steps with no stage selected.
+
+        Used only for the final save path (via ``get_branch``), where an
+        incomplete step should be treated as "not part of the branch yet"
+        rather than crashing. Reorder/remove handlers must NOT use this —
+        see ``_collect_steps_raw``.
+        """
         steps = []
         for editor in self._step_editors:
             step = editor.get_step()
             if step is not None:
                 steps.append(step)
         return steps
+
+    def _collect_steps_raw(self) -> list[list[Any]]:
+        """Collect steps from editors without dropping incomplete ones.
+
+        Keeps a 1:1 correspondence with ``self._step_editors`` (and thus
+        with the UI), which is required for remove/move-by-index to target
+        the right editor (WG-26).
+        """
+        return [editor.to_raw_list() for editor in self._step_editors]
 
     def get_branch(self) -> list[Any] | None:
         """Return [branch_name, steps] or None if invalid."""
@@ -159,6 +184,17 @@ class _BranchEditor:
             return None
         steps = self._collect_steps()
         return [name, steps]
+
+    def get_branch_raw(self) -> list[Any]:
+        """Return [branch_name, steps] reflecting current UI state verbatim.
+
+        Unlike ``get_branch``, never signals "invalid" for a blank name —
+        used by the parent step's remove/move handlers so popping/swapping
+        by index stays aligned with the branch editors actually on screen,
+        even while a branch name is still being typed (WG-26).
+        """
+        name = (self._name_input.value or "").strip()
+        return [name, self._collect_steps_raw()]
 
 
 # ---------------------------------------------------------------------------
@@ -220,12 +256,24 @@ class _StepEditor:
                             "flat round dense size=sm color=negative"
                         )
 
+            # `ui.select(value=...)` raises ValueError if the value isn't
+            # among `options` — which happens for a step referencing a
+            # stage that has since been removed/renamed in the registry
+            # (e.g. after an upgrade). Fall back to unset rather than
+            # crashing the whole editor (WG-27).
+            initial_stage_value = (
+                initial_stage if initial_stage in stage_options else None
+            )
             self._stage_select = ui.select(
                 options=stage_options,
-                value=initial_stage or None,
+                value=initial_stage_value,
                 label="Stage",
                 on_change=self._on_stage_change,
             ).classes("w-full").props("outlined dense")
+            if initial_stage and initial_stage_value is None:
+                ui.label(
+                    f"⚠ Unknown stage '{initial_stage}' — select a replacement."
+                ).classes("text-caption text-warning")
 
             self._params_container = ui.column().classes("w-full gap-1 q-mt-xs")
             self._branches_container = ui.column().classes("w-full gap-2 q-mt-xs")
@@ -295,9 +343,13 @@ class _StepEditor:
                     branch_name = f"branch_{i + 1}"
                     branch_steps = [["", {}]]
 
+                # Uses the raw (non-filtering) collector so `pop(idx)`
+                # targets the branch editor actually at UI position `idx`,
+                # even if an earlier branch currently has a blank name
+                # (WG-26).
                 def make_remove(idx=i):
                     def remove():
-                        current = self._collect_branches()
+                        current = self._collect_branches_raw()
                         current.pop(idx)
                         self._rebuild_branches(current)
                     return remove
@@ -313,19 +365,31 @@ class _StepEditor:
 
     def _add_branch(self) -> None:
         """Add a new empty branch."""
-        current = self._collect_branches()
+        current = self._collect_branches_raw()
         n = len(current) + 1
         current.append([f"branch_{n}", [["", {}]]])
         self._rebuild_branches(current)
 
     def _collect_branches(self) -> list[list[Any]]:
-        """Collect branch data from editors."""
+        """Collect branch data from editors, dropping unnamed branches.
+
+        Used only for the final save path. Reorder/remove handlers must
+        use ``_collect_branches_raw`` instead — see WG-26.
+        """
         branches = []
         for editor in self._branch_editors:
             branch = editor.get_branch()
             if branch is not None:
                 branches.append(branch)
         return branches
+
+    def _collect_branches_raw(self) -> list[list[Any]]:
+        """Collect branch data from editors without dropping unnamed ones.
+
+        Keeps 1:1 correspondence with ``self._branch_editors`` so
+        remove-by-index stays aligned with what's on screen (WG-26).
+        """
+        return [editor.get_branch_raw() for editor in self._branch_editors]
 
     def _render_params(self, stage_name: str) -> None:
         """Render parameter input fields for the selected stage."""
@@ -426,6 +490,25 @@ class _StepEditor:
             return [stage, config, alias]
         return [stage, config]
 
+    def to_raw_list(self) -> list[Any]:
+        """Return this step's current UI state verbatim, even if incomplete.
+
+        Unlike ``get_step`` (which returns ``None`` for a step with no
+        stage selected yet, so it can be filtered out at save time), this
+        always returns a step entry — used by remove/move handlers that
+        need their by-index collection to match the on-screen editor list
+        1:1 (WG-26).
+        """
+        stage = self._stage_select.value or ""
+        if stage in _FORK_STAGES:
+            config = {"branches": self._collect_branches_raw()}
+        else:
+            config = self.get_step()[1] if stage else dict(self.config)
+        alias = (self._alias_input.value or "").strip()
+        if alias:
+            return [stage, config, alias]
+        return [stage, config]
+
 
 # ---------------------------------------------------------------------------
 # Pipeline editor dialog
@@ -484,16 +567,23 @@ async def _open_pipeline_editor(
                     config = step_data[1] if len(step_data) > 1 else {}
                     alias = step_data[2] if len(step_data) > 2 else ""
 
+                    # Reorder/remove use the raw (non-filtering) collector
+                    # so index `idx` always matches the editor at UI
+                    # position `idx`, including steps with no stage chosen
+                    # yet — the filtering collector would silently drop
+                    # those and make `pop(idx)` act on the wrong step, or
+                    # raise IndexError once enough steps are incomplete
+                    # (WG-26).
                     def make_remove(idx=i):
                         def remove():
-                            current = _collect_steps()
+                            current = _collect_steps_raw()
                             current.pop(idx)
                             rebuild_steps(current)
                         return remove
 
                     def make_move_up(idx=i):
                         def move_up():
-                            current = _collect_steps()
+                            current = _collect_steps_raw()
                             if idx > 0:
                                 current[idx - 1], current[idx] = current[idx], current[idx - 1]
                                 rebuild_steps(current)
@@ -501,7 +591,7 @@ async def _open_pipeline_editor(
 
                     def make_move_down(idx=i):
                         def move_down():
-                            current = _collect_steps()
+                            current = _collect_steps_raw()
                             if idx < len(current) - 1:
                                 current[idx], current[idx + 1] = current[idx + 1], current[idx]
                                 rebuild_steps(current)
@@ -520,7 +610,11 @@ async def _open_pipeline_editor(
                     step_editors.append(editor)
 
         def _collect_steps() -> list[list[Any]]:
-            """Collect current step definitions from editors."""
+            """Collect current step definitions, dropping incomplete steps.
+
+            Used only on the final save path — see ``_collect_steps_raw``
+            for why reorder/remove handlers must not use this (WG-26).
+            """
             steps = []
             for editor in step_editors:
                 step = editor.get_step()
@@ -528,9 +622,13 @@ async def _open_pipeline_editor(
                     steps.append(step)
             return steps
 
+        def _collect_steps_raw() -> list[list[Any]]:
+            """Collect step definitions 1:1 with the on-screen editors."""
+            return [editor.to_raw_list() for editor in step_editors]
+
         def add_step() -> None:
             """Add a new empty step at the end."""
-            current = _collect_steps()
+            current = _collect_steps_raw()
             current.append(["", {}])
             rebuild_steps(current)
 
@@ -551,16 +649,72 @@ async def _open_pipeline_editor(
                 value=json.dumps(pipeline["steps"], indent=2) if pipeline else "[]",
             ).classes("w-full").props("outlined").style("font-family: monospace")
 
+            def _validate_steps_structure(steps: Any, *, path: str = "steps") -> str | None:
+                """Return an error message if ``steps`` isn't a well-formed step list.
+
+                Previously only ``json.JSONDecodeError`` was caught around
+                ``rebuild_steps``, so syntactically valid but structurally
+                wrong JSON (e.g. a list of strings, or a branch missing its
+                steps list) propagated into ``_StepEditor``/``_BranchEditor``
+                construction and crashed the page instead of showing a
+                notification (WG-27).
+                """
+                if not isinstance(steps, list):
+                    return f"{path} must be a list"
+                for i, step in enumerate(steps):
+                    if not isinstance(step, (list, tuple)):
+                        return f"{path}[{i}] must be a list of [stage, config] (or with alias)"
+                    if len(step) < 1 or len(step) > 3:
+                        return f"{path}[{i}] must have 1 to 3 elements: [stage, config, alias?]"
+                    if not isinstance(step[0], str):
+                        return f"{path}[{i}][0] (stage name) must be a string"
+                    if len(step) > 1 and not isinstance(step[1], dict):
+                        return f"{path}[{i}][1] (config) must be an object"
+                    if len(step) > 2 and not isinstance(step[2], str):
+                        return f"{path}[{i}][2] (alias) must be a string"
+                    config = step[1] if len(step) > 1 and isinstance(step[1], dict) else {}
+                    if step[0] in _FORK_STAGES and "branches" in config:
+                        branches = config["branches"]
+                        if isinstance(branches, dict):
+                            branches = list(branches.items())
+                        if not isinstance(branches, list):
+                            return f"{path}[{i}].config.branches must be a list"
+                        for j, branch in enumerate(branches):
+                            if (
+                                not isinstance(branch, (list, tuple))
+                                or len(branch) != 2
+                                or not isinstance(branch[0], str)
+                            ):
+                                return (
+                                    f"{path}[{i}].config.branches[{j}] must be "
+                                    "[branch_name, steps]"
+                                )
+                            err = _validate_steps_structure(
+                                branch[1], path=f"{path}[{i}].branches[{j}].steps"
+                            )
+                            if err:
+                                return err
+                return None
+
             def import_json() -> None:
                 try:
                     steps = json.loads(json_area.value or "[]")
-                    if not isinstance(steps, list):
-                        ui.notify("JSON must be a list of steps", type="negative")
-                        return
-                    rebuild_steps(steps)
-                    ui.notify("Steps imported from JSON", type="positive")
                 except json.JSONDecodeError as e:
                     ui.notify(f"Invalid JSON: {e}", type="negative")
+                    return
+
+                error = _validate_steps_structure(steps)
+                if error:
+                    ui.notify(f"Invalid pipeline structure: {error}", type="negative")
+                    return
+
+                try:
+                    rebuild_steps(steps)
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("Failed to rebuild steps from imported JSON")
+                    ui.notify(f"Could not apply imported steps: {exc}", type="negative")
+                    return
+                ui.notify("Steps imported from JSON", type="positive")
 
             def export_json() -> None:
                 steps = _collect_steps()
@@ -580,30 +734,54 @@ async def _open_pipeline_editor(
         error_label.set_visibility(False)
 
         async def do_save() -> None:
-            steps = _collect_steps()
-            name = name_input.value or ""
-            description = desc_input.value or ""
-
+            # Guard against double-submit (WG-23).
+            if save_btn.props.get("disable"):
+                return
+            save_btn.props("disable loading")
             try:
-                if is_edit:
-                    await user_pipelines_service.update_user_pipeline(
-                        pipeline["id"], name, description, steps
+                error_label.set_visibility(False)
+                steps = _collect_steps()
+                name = (name_input.value or "").strip()
+                description = desc_input.value or ""
+
+                # The dynamic form has no real client-side validation
+                # (missing names/stages were only cosmetically flagged, if
+                # at all) — enforce the actual required fields here before
+                # calling the service, instead of letting an incomplete
+                # pipeline save silently (WG-27).
+                if not name:
+                    error_label.text = "Pipeline name is required."
+                    error_label.set_visibility(True)
+                    return
+                if not steps:
+                    error_label.text = (
+                        "Add at least one complete step (with a stage selected)."
                     )
-                    ui.notify("Pipeline updated", type="positive")
-                else:
-                    await user_pipelines_service.create_user_pipeline(
-                        name, description, steps
-                    )
-                    ui.notify("Pipeline created", type="positive")
-                dlg.close()
-                await on_save()
-            except user_pipelines_service.UserPipelineError as exc:
-                error_label.text = str(exc)
-                error_label.set_visibility(True)
+                    error_label.set_visibility(True)
+                    return
+
+                try:
+                    if is_edit:
+                        await user_pipelines_service.update_user_pipeline(
+                            pipeline["id"], name, description, steps
+                        )
+                        ui.notify("Pipeline updated", type="positive")
+                    else:
+                        await user_pipelines_service.create_user_pipeline(
+                            name, description, steps
+                        )
+                        ui.notify("Pipeline created", type="positive")
+                    dlg.close()
+                    await on_save()
+                except user_pipelines_service.UserPipelineError as exc:
+                    error_label.text = str(exc)
+                    error_label.set_visibility(True)
+            finally:
+                save_btn.props(remove="disable loading")
 
         with ui.row().classes("w-full justify-end gap-2 q-mt-md"):
             ui.button("Cancel", on_click=dlg.close).props("flat")
-            ui.button(
+            save_btn = ui.button(
                 "Save" if is_edit else "Create",
                 on_click=do_save,
             ).props("color=primary")
@@ -671,13 +849,20 @@ def _build_pipeline_card(pipeline: dict[str, Any], *, on_refresh) -> None:
 
             async def do_run(p=pipeline) -> None:
                 from webgui.services import jobs as jobs_service
-                pipeline_key = f"{user_pipelines_service.USER_PIPELINE_PREFIX}{p['id']}"
+
+                # Guard against double-submit (WG-23).
+                if run_btn.props.get("disable"):
+                    return
+                run_btn.props("disable loading")
                 try:
+                    pipeline_key = f"{user_pipelines_service.USER_PIPELINE_PREFIX}{p['id']}"
                     record = await jobs_service.create_job(pipeline_key, {})
                     ui.notify(f"Job {record.id} started", type="positive")
                     ui.navigate.to("/jobs")
                 except Exception as exc:
                     ui.notify(f"Failed: {exc}", type="negative")
+                finally:
+                    run_btn.props(remove="disable loading")
 
             async def do_edit(p=pipeline) -> None:
                 await _open_pipeline_editor(pipeline=p, on_save=on_refresh)
@@ -685,7 +870,7 @@ def _build_pipeline_card(pipeline: dict[str, Any], *, on_refresh) -> None:
             async def do_delete(p=pipeline) -> None:
                 await _confirm_delete(p, on_refresh=on_refresh)
 
-            ui.button(
+            run_btn = ui.button(
                 "Run", icon="play_arrow", on_click=do_run
             ).props("flat size=sm color=primary")
             ui.button(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import math
 from typing import Any
 
 from smart_albums.core.context import PipelineContext, ContextBatch
@@ -110,6 +111,12 @@ class AnalyzeScore(Stage):
                 if hit is not None:
                     logger.debug("Cache HIT for asset %s — skipping LLM call", asset.id)
                     asset.metadata.update(hit)
+                    # A cache hit always represents a *successful* prior
+                    # analysis (error results are never cached, see below),
+                    # so clear out any stale error/vision_error left over
+                    # from a previous failed run of this stage.
+                    asset.metadata.pop("error", None)
+                    asset.metadata.pop("vision_error", None)
                     async with lock:
                         cached += 1
                     if progress:
@@ -136,21 +143,56 @@ class AnalyzeScore(Stage):
                     )
                     logger.debug("LLM result for asset %s: %s", asset.id, result)
 
-                    # Backend error: result contains an "error" key
-                    if isinstance(result, dict) and "error" in result:
+                    if not isinstance(result, dict):
+                        # A client that doesn't honor the documented
+                        # dict-or-{"error": ...} contract (e.g. returns a
+                        # list or None) would otherwise raise AttributeError
+                        # from result.get() below, escape the try/except
+                        # entirely (none of the caught exception types match
+                        # AttributeError), and abort the whole
+                        # asyncio.gather() for every other in-flight asset.
+                        raise TypeError(
+                            f"LLM client returned {type(result).__name__}, expected dict"
+                        )
+
+                    # Backend error: result contains an "error" key. This
+                    # counts as a failure (not "computed"), is not cached,
+                    # and is tagged with vision_error so filter.sensitive's
+                    # fail_closed option can distinguish "vision analysis
+                    # failed" from unrelated errors set by other stages.
+                    if "error" in result:
                         logger.debug(
                             "LLM returned error for asset %s: %s", asset.id, result["error"]
                         )
                         asset.metadata["score"] = 0.0
                         asset.metadata["error"] = result["error"]
+                        asset.metadata["vision_error"] = result["error"]
+                        async with lock:
+                            failures += 1
                     else:
-                        score = float(result.get("score", 0.0))
+                        raw_score = result.get("score", 0.0)
+                        try:
+                            score = float(raw_score)
+                        except (TypeError, ValueError) as exc:
+                            raise ValueError(
+                                f"LLM returned a non-numeric score: {raw_score!r}"
+                            ) from exc
+                        if not math.isfinite(score):
+                            raise ValueError(f"LLM returned a non-finite score: {raw_score!r}")
+                        # Scores are documented/consumed downstream (e.g.
+                        # min_score's threshold, select.best's weighting) as
+                        # being in [0.0, 1.0]. A model answering on a
+                        # different scale (0-10, 0-100) would otherwise
+                        # silently break every stage that assumes [0, 1]
+                        # rather than surfacing as an error.
+                        score = max(0.0, min(1.0, score))
                         is_screenshot = bool(result.get("is_screenshot", False))
 
                         asset.metadata["score"] = score
                         asset.metadata["is_screenshot"] = is_screenshot
                         # Clear any previous error on successful re-analysis
                         asset.metadata.pop("error", None)
+                        asset.metadata.pop("vision_error", None)
 
                         logger.debug(
                             "Scored asset %s: score=%.3f, is_screenshot=%s",
@@ -165,34 +207,25 @@ class AnalyzeScore(Stage):
                             })
                             logger.debug("Cached result for asset %s", asset.id)
 
-                    async with lock:
-                        computed += 1
+                        async with lock:
+                            computed += 1
 
-                except (ConnectionError, OSError, TimeoutError) as exc:
-                    # Transient network/IO errors — set error on asset, don't abort
+                except Exception as exc:
+                    # Catch every exception, not just a curated subset.
+                    # The previous version only caught (ConnectionError,
+                    # OSError, TimeoutError, ValueError, TypeError, KeyError,
+                    # RuntimeError). Anything else — an AttributeError from
+                    # a malformed client response, a client-specific
+                    # exception that isn't an OSError subclass (e.g. some
+                    # httpx/aiohttp errors), asyncio.CancelledError from an
+                    # internal timeout, etc. — would propagate out of this
+                    # task, fail the whole asyncio.gather() below, and lose
+                    # every other asset's result along with it, including
+                    # skipping progress.finish_stage() and the stats update.
                     asset.metadata["error"] = str(exc)
+                    asset.metadata["vision_error"] = str(exc)
                     logger.warning(
-                        "analyze.score: transient error for asset %s: %s",
-                        asset.id,
-                        exc,
-                    )
-                    async with lock:
-                        failures += 1
-                except (ValueError, TypeError, KeyError) as exc:
-                    # Data/parsing errors from the LLM response processing
-                    asset.metadata["error"] = str(exc)
-                    logger.warning(
-                        "analyze.score: data error for asset %s: %s",
-                        asset.id,
-                        exc,
-                    )
-                    async with lock:
-                        failures += 1
-                except RuntimeError as exc:
-                    # Missing client or model errors
-                    asset.metadata["error"] = str(exc)
-                    logger.warning(
-                        "analyze.score: runtime error for asset %s: %s",
+                        "analyze.score: error for asset %s: %s",
                         asset.id,
                         exc,
                     )

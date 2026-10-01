@@ -21,6 +21,21 @@ from webgui.auth import get_current_username
 
 logger = logging.getLogger(__name__)
 
+# --- Shared provider-status cache -------------------------------------------
+#
+# Each open browser tab renders its own navbar, and previously each one
+# started its own `ui.timer(30.0, refresh_status)` that independently called
+# every configured provider's health check endpoint. With N tabs open that's
+# N x (number of providers) outbound health-check calls every 30 seconds
+# for data that's identical across tabs (WG-22). Instead, a single
+# process-wide background task refreshes `_latest_status` on an interval,
+# and each tab's navbar just reads the cached value and re-renders — no
+# per-tab network calls.
+_latest_status: dict[str, tuple[bool | None, str, str]] = {}
+_status_ready = asyncio.Event()
+_background_task: asyncio.Task[None] | None = None
+_STATUS_REFRESH_INTERVAL = 30.0
+
 
 def build_navbar() -> None:
     """Render the application-wide navigation bar.
@@ -103,12 +118,40 @@ def build_navbar() -> None:
                     ).props("dense")
 
 
+def _ensure_background_refresh() -> None:
+    """Start the shared provider-health polling task if it isn't running yet.
+
+    Safe to call from every tab's navbar — only the first call actually
+    starts the task (WG-22).
+    """
+    global _background_task
+    if _background_task is not None and not _background_task.done():
+        return
+
+    async def _loop() -> None:
+        while True:
+            try:
+                global _latest_status
+                _latest_status = await _check_all_providers()
+            except Exception:  # noqa: BLE001
+                logger.exception("Provider status refresh failed")
+            finally:
+                _status_ready.set()
+            await asyncio.sleep(_STATUS_REFRESH_INTERVAL)
+
+    _background_task = asyncio.ensure_future(_loop())
+
+
 def _build_status_indicator() -> None:
     """Build the cloud status icon with a dropdown menu showing per-provider health.
 
-    The icon starts grey (unknown) and updates asynchronously after the page
-    loads. A periodic timer refreshes every 30 seconds.
+    The icon starts grey (unknown) and updates once the shared background
+    refresh (see `_ensure_background_refresh`) has a result. Each tab polls
+    the shared `_latest_status` cache locally every few seconds to redraw —
+    it does not trigger its own health-check calls (WG-22).
     """
+    _ensure_background_refresh()
+
     # The button that shows the summary icon
     status_btn = ui.button(icon="cloud_queue").props(
         "flat round dense size=sm color=grey-5"
@@ -122,14 +165,20 @@ def _build_status_indicator() -> None:
     with menu:
         status_container = ui.column().classes("q-pa-sm gap-1").style("min-width: 200px")
 
-    async def refresh_status() -> None:
-        """Fetch provider health and update the indicator."""
-        results = await _check_all_providers()
-        _update_indicator(status_btn, status_container, results)
+    last_rendered: dict[str, Any] = {"results": None}
 
-    # Initial fetch shortly after page load, then every 30s
-    ui.timer(0.5, refresh_status, once=True)
-    ui.timer(30.0, refresh_status)
+    def render_from_cache() -> None:
+        if _latest_status == last_rendered["results"]:
+            return
+        last_rendered["results"] = dict(_latest_status)
+        _update_indicator(status_btn, status_container, _latest_status)
+
+    if _status_ready.is_set():
+        render_from_cache()
+
+    # Light local timer just re-renders this tab's icon from the shared
+    # cache — it never performs a network call itself.
+    ui.timer(2.0, render_from_cache)
 
 
 def _update_indicator(

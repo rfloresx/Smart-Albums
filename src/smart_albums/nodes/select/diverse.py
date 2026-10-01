@@ -126,8 +126,17 @@ def _mmr_select(
                             max_sim = sim
                 diversity = 1.0 - max_sim
             else:
-                # No embedding for candidate: treat as maximally diverse
-                diversity = 1.0
+                # A candidate with no embedding (an embedding fetch/compute
+                # failure upstream) previously got diversity=1.0 — the
+                # maximum possible value, higher than any embedded
+                # candidate could normally achieve against an already-picked
+                # near-duplicate. That made failed-embedding assets the
+                # *most* attractive picks under MMR, rewarding missing data
+                # instead of being neutral about it (ND-21). Score it as
+                # minimally diverse instead, so it only gets picked on the
+                # strength of its quality score, not because of a comparison
+                # that was never actually made.
+                diversity = 0.0
 
             mmr_score = quality_weight * q_score + diversity_weight * diversity
 
@@ -170,39 +179,48 @@ class SelectDiversePick(Stage):
             key="max_picks",
             type=int,
             default=3,
-            description="Maximum number of assets to pick from each group.",
+            min=1,
+            description="Maximum number of assets to pick from each group. "
+            "The first (highest-quality) pick is always made unconditionally, "
+            "so a value <= 0 would still select exactly one asset while "
+            "claiming to allow zero (ND-15) — the minimum enforces that the "
+            "configured value matches actual behavior.",
         ),
         ConfigParam(
             key="pick_percentage",
             type=float,
             default=0.33,
+            min=0.0,
+            max=1.0,
             description="Fraction of group assets to pick (capped by max_picks).",
         ),
         ConfigParam(
             key="quality_weight",
             type=float,
             default=0.3,
+            min=0.0,
             description="Weight for quality score in MMR combined score.",
         ),
         ConfigParam(
             key="diversity_weight",
             type=float,
             default=0.7,
+            min=0.0,
             description="Weight for diversity (embedding distance) in MMR combined score.",
         ),
     )
 
     async def run(self, ctx: PipelineContext) -> ContextBatch:
         if not ctx.assets:
-            ctx.stats["groups_processed"] = 0
-            ctx.stats["picks_selected"] = 0
+            ctx.stats["select.diverse_pick.groups_processed"] = 0
+            ctx.stats["select.diverse_pick.picks_selected"] = 0
             return [ctx]
 
         if len(ctx.assets) < 2:
             ctx.assets[0].metadata["group_pick"] = True
             ctx.assets[0].metadata["group_best"] = True
-            ctx.stats["groups_processed"] = 1
-            ctx.stats["picks_selected"] = 1
+            ctx.stats["select.diverse_pick.groups_processed"] = 1
+            ctx.stats["select.diverse_pick.picks_selected"] = 1
             return [ctx]
 
         max_picks = self.get("max_picks")
@@ -219,6 +237,11 @@ class SelectDiversePick(Stage):
         picks[0].metadata["group_best"] = True
 
         ctx.assets = picks
-        ctx.stats["groups_processed"] = 1
-        ctx.stats["picks_selected"] = len(picks)
+        # Namespaced under "select.diverse_pick." (previously bare
+        # "groups_processed"/"picks_selected") — generic names collided
+        # with identically-named stats from other stages once
+        # merge.concat's _flatten_stats summed them together across
+        # branches/partitions (ND-21).
+        ctx.stats["select.diverse_pick.groups_processed"] = 1
+        ctx.stats["select.diverse_pick.picks_selected"] = len(picks)
         return [ctx]

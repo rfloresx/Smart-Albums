@@ -13,6 +13,7 @@ from typing import Any
 from smart_albums.core.context import PipelineContext, ContextBatch
 from smart_albums.core.node import Stage, ConfigParam
 from smart_albums.core.registry import stage
+from smart_albums.utils.datetime_utils import to_aware_utc
 from smart_albums.utils.split import split_contexts
 
 
@@ -51,11 +52,15 @@ class PartitionTime(Stage):
             # All assets lack timestamps — return as a single partition
             return [ctx]
 
-        sorted_assets = sorted(timed_assets, key=lambda a: (a.captured_at, a.id))
+        # Normalize to aware-UTC before any comparison/subtraction so a mix
+        # of naive and aware captured_at values (different source clients
+        # disagree — see CL-12) doesn't raise TypeError (ND-14).
+        sorted_assets = sorted(timed_assets, key=lambda a: (to_aware_utc(a.captured_at), a.id))
 
         partitions: list[list[Any]] = [[sorted_assets[0]]]
         for asset in sorted_assets[1:]:
-            if asset.captured_at - partitions[-1][-1].captured_at > window:
+            gap = to_aware_utc(asset.captured_at) - to_aware_utc(partitions[-1][-1].captured_at)
+            if gap > window:
                 partitions.append([asset])
             else:
                 partitions[-1].append(asset)

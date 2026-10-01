@@ -61,7 +61,20 @@ class TestHandleEmptyPool:
         pre_filter = [make_asset(id=f"a{i}") for i in range(20)]
         node = _FakeNode({"on_empty_pool": EmptyBehavior.FALLBACK_RANDOM, "rng_seed": 42})
         result = handle_empty_pool(node, ctx, [], pre_filter, photo_count=5)
+
+        # Beyond the count (TS-03), assert the result is a genuine *sample*
+        # of the pre-filter pool: the right size, drawn only from the pool,
+        # with no duplicates, and — because a seed is set — not simply the
+        # first N in input order (which would betray a head-slice rather
+        # than a sample).
         assert len(result) == 5
+        pool_ids = {a.id for a in pre_filter}
+        result_ids = [a.id for a in result]
+        assert all(rid in pool_ids for rid in result_ids), "sampled from the pool"
+        assert len(set(result_ids)) == 5, "no duplicate picks"
+        assert result_ids != [f"a{i}" for i in range(5)], (
+            "a seeded sample should not coincide with the first 5 in order"
+        )
 
     def test_empty_fallback_random_deterministic(self):
         ctx1 = make_context()

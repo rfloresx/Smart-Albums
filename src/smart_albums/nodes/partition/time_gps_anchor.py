@@ -1,5 +1,13 @@
 """partition.time_gps_anchor — two-stage partitioning by time then GPS anchor.
 
+See ``partition.time_gps``'s module docstring for a side-by-side comparison
+of the two time/GPS partitioners' semantics (ND-13). In short: this stage
+clusters by time first, then sub-partitions each time cluster by GPS
+against a fixed anchor (bounding group spread), and keeps GPS-less assets
+grouped within their time cluster — whereas ``partition.time_gps`` compares
+each asset only against its immediate predecessor and splits every GPS-less
+asset into its own partition.
+
 Replicates the original BestOfPipeline partitioning strategy:
 
 1. **Time partitioning**: Sorts assets by captured_at and groups consecutive
@@ -26,6 +34,7 @@ from smart_albums.core.context import PipelineContext, ContextBatch
 from protocols_system.protocols import Asset
 from smart_albums.core.node import Stage, ConfigParam
 from smart_albums.core.registry import stage
+from smart_albums.utils.datetime_utils import to_aware_utc
 from smart_albums.utils.split import split_contexts
 
 
@@ -86,7 +95,9 @@ def _partition_by_time(
     if not timed:
         return [], untimed
 
-    sorted_assets = sorted(timed, key=lambda a: (a.captured_at, a.id))
+    # Normalize to aware-UTC so a mix of naive and aware captured_at values
+    # doesn't raise TypeError on comparison/subtraction (ND-14).
+    sorted_assets = sorted(timed, key=lambda a: (to_aware_utc(a.captured_at), a.id))
 
     clusters: list[list[Asset]] = [[sorted_assets[0]]]
     for asset in sorted_assets[1:]:
@@ -95,7 +106,7 @@ def _partition_by_time(
         if asset.captured_at is None or prev.captured_at is None:
             clusters.append([asset])
             continue
-        if (asset.captured_at - prev.captured_at) <= time_window:
+        if (to_aware_utc(asset.captured_at) - to_aware_utc(prev.captured_at)) <= time_window:
             clusters[-1].append(asset)
         else:
             clusters.append([asset])

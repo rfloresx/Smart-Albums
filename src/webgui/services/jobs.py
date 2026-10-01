@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import shutil
+import signal
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -26,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from webgui.models import JobRecord, JobStatus
+from webgui.services import prompts as prompts_service
 from webgui.state import state
 
 logger = logging.getLogger(__name__)
@@ -35,10 +37,29 @@ _CONFIG_DIR = Path("/tmp/smart-albums-jobs")
 _PROMPT_DIR = _CONFIG_DIR / "prompts"
 _LOGS_DIR = Path("/tmp/smart-albums-jobs/logs")
 
+# StreamReader buffer limit for the subprocess's stdout, well above the
+# asyncio default of 64 KiB so a large (but not absurd) progress JSON line
+# or traceback doesn't overrun it.
+_STREAM_LINE_LIMIT = 8 * 1024 * 1024
+
+# How long to wait for a killed subprocess to exit before giving up on it.
+_PROCESS_KILL_TIMEOUT_SECONDS = 10
+
 # Maximum number of pipeline subprocesses that can run concurrently.
 # Additional jobs wait in the queue until a slot becomes available.
 MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "4"))
 _job_semaphore: asyncio.Semaphore | None = None
+
+# Strong references to in-flight job tasks, so they aren't garbage-collected
+# mid-run (see create_job()).
+_background_tasks: set[asyncio.Task[None]] = set()
+
+# Job IDs that cancel_job() has been asked to cancel. Checked by _run_job at
+# two points: right after acquiring the concurrency semaphore (so a pending
+# job never spawns a subprocess at all), and in the finally block (so the
+# terminal status/error reflects "cancelled", not whatever exit code the
+# killed subprocess happened to produce).
+_cancelled_jobs: set[str] = set()
 
 
 def _get_job_semaphore() -> asyncio.Semaphore:
@@ -121,10 +142,22 @@ def _build_cli_config(pipeline_settings: dict[str, Any], job_id: str) -> dict[st
         settings["score"] = score_cfg
     elif score_cfg.get("prompt_file"):
         pf = score_cfg["prompt_file"]
-        user_path = Path(state.config.prompts_dir) / pf
-        if user_path.exists():
-            score_cfg["prompt_file"] = str(user_path)
-            settings["score"] = score_cfg
+        try:
+            # Route through the same traversal guard the Prompts page uses
+            # (services.prompts._safe_path) instead of a bare `Path(...) /
+            # pf` join. An absolute path (e.g. "/etc/passwd") or a "../"
+            # value previously escaped prompts_dir; worse, if the escaped
+            # path didn't exist, the *raw* value was still forwarded to the
+            # CLI unchanged, which read it and sent its contents to the
+            # configured LLM (WG-14). Any invalid reference now fails the
+            # job up front with a clear error instead.
+            user_path = prompts_service.resolve_prompt_path(pf)
+        except prompts_service.PromptError as exc:
+            raise ValueError(f"Invalid prompt_file reference {pf!r}: {exc}") from exc
+        if not user_path.exists():
+            raise ValueError(f"Prompt file not found: {pf!r}")
+        score_cfg["prompt_file"] = str(user_path)
+        settings["score"] = score_cfg
 
     cfg: dict[str, Any] = {
         "log_level": log_level,
@@ -198,30 +231,71 @@ async def create_job(pipeline_name: str, pipeline_settings: dict[str, Any]) -> J
         pipeline_settings=pipeline_settings,
     )
     await state.db.create_job(record)
-    asyncio.create_task(_run_job(job_id))
+    task = asyncio.create_task(_run_job(job_id))
+    # Keep a strong reference so the task isn't garbage-collected mid-run
+    # (asyncio only holds a weak reference internally) and so an unexpected
+    # exception is at least logged via the done-callback instead of being
+    # silently dropped.
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
     return record
 
 
 async def cancel_job(job_id: str) -> None:
-    """Terminate a running job's subprocess.
+    """Cancel a job, whether it's queued (pending) or already running.
+
+    For a pending job (still waiting on the concurrency semaphore, no
+    subprocess started yet), this sets a flag that ``_run_job`` checks
+    right after acquiring its semaphore slot, so the job never spawns a
+    subprocess at all. For a running job, the subprocess (and its whole
+    process group, so grandchildren are included) is sent SIGTERM; if it
+    hasn't exited after a grace period, SIGKILL follows.
+
+    The cancellation reason is recorded via ``_cancelled_jobs`` rather than
+    writing the DB record directly, so ``_run_job``'s own ``finally`` block
+    (which also writes a terminal status/error) doesn't race with this
+    function and overwrite "Cancelled by user" with a generic
+    "Process exited with code -15".
 
     Raises:
-        ValueError: If the job is not currently running.
+        ValueError: If the job doesn't exist or has already finished.
     """
     record = await state.db.get_job(job_id)
     if record is None:
         raise ValueError(f"Job {job_id} not found")
-    if record.status != JobStatus.running:
-        raise ValueError("Job is not running")
+    if record.status not in (JobStatus.pending, JobStatus.running):
+        raise ValueError("Job is not pending or running")
+
+    _cancelled_jobs.add(job_id)
+
     proc = state.running_processes.get(job_id)
-    if proc:
-        proc.terminate()
-    record.status = JobStatus.failed
-    record.error = "Cancelled by user"
-    record.completed_at = datetime.now(timezone.utc)
-    await state.db.update_job(record)
-    state.running_jobs.pop(job_id, None)
-    state.running_processes.pop(job_id, None)
+    if proc is not None and proc.returncode is None:
+        try:
+            # Kill the whole process group (see start_new_session=True in
+            # _run_job), not just the direct child, so a pipeline that
+            # spawned its own subprocesses doesn't leave them running.
+            os.killpg(proc.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            proc.terminate()
+
+        async def _escalate() -> None:
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=_PROCESS_KILL_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                logger.warning("Job %s: did not exit after SIGTERM; sending SIGKILL", job_id)
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    proc.kill()
+
+        task = asyncio.create_task(_escalate())
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+    else:
+        # Still pending (no subprocess yet) — _run_job will see the flag
+        # and finalize the record itself once it wakes up from the
+        # semaphore. Nothing further to do here.
+        pass
 
 
 async def delete_job(job_id: str) -> None:
@@ -254,9 +328,21 @@ def get_live_job(job_id: str) -> JobRecord | None:
     return state.running_jobs.get(job_id)
 
 
-async def list_jobs() -> list[JobRecord]:
+async def list_jobs(*, limit: int | None = None) -> list[JobRecord]:
     """List all jobs, overlaying live progress for running ones."""
-    jobs = await state.db.list_jobs()
+    jobs = await state.db.list_jobs(limit=limit)
+    return [state.running_jobs.get(j.id, j) for j in jobs]
+
+
+async def list_job_summaries(*, limit: int | None = None) -> list[JobRecord]:
+    """List jobs without ``log_output``, overlaying live progress for running ones.
+
+    Intended for frequent polling (see pages/jobs.py's 3-second timer).
+    Running jobs are overlaid with the in-memory record from
+    ``state.running_jobs``, which does carry ``log_output`` for the tail
+    currently held in memory — only the DB-backed historical jobs skip it.
+    """
+    jobs = await state.db.list_job_summaries(limit=limit)
     return [state.running_jobs.get(j.id, j) for j in jobs]
 
 
@@ -305,27 +391,47 @@ async def _run_job(job_id: str) -> None:
         if record is None or record.status != JobStatus.pending:
             return
 
+        if job_id in _cancelled_jobs:
+            # Cancelled while still queued — finalize without ever
+            # spawning a subprocess. Previously a pending job had no
+            # cancel path at all (cancel_job only accepted "running").
+            _cancelled_jobs.discard(job_id)
+            record.status = JobStatus.failed
+            record.error = "Cancelled by user"
+            record.completed_at = datetime.now(timezone.utc)
+            await state.db.update_job(record)
+            return
+
         record.status = JobStatus.running
         record.started_at = datetime.now(timezone.utc)
         await state.db.update_job(record)
         state.running_jobs[job_id] = record
 
-        cli_config = _build_cli_config(record.pipeline_settings, job_id)
-
-        _CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-        _LOGS_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # Everything from here on (config building, directory setup, and
+        # the subprocess itself) runs inside try/finally. Previously, the
+        # config-building and mkdir calls ran *before* this point, so a
+        # failure there (disk full, a permission error, a bad nested
+        # setting) left the job's status stuck at "running" forever, both
+        # in the DB and in ``state.running_jobs`` — nothing ever reached the
+        # code that sets a terminal status. Moving that work inside the try
+        # ensures every failure path is finalized the same way.
+        proc: asyncio.subprocess.Process | None = None
         config_file = _CONFIG_DIR / f"{job_id}.json"
-        log_file = get_log_file(job_id)
-        # For built-in pipelines, inject export dir if applicable
-        _inject_export_directory(cli_config, job_id)
-        _write_config_file(config_file, cli_config)
-
-        log_level = record.pipeline_settings.get("_log_level", "INFO")
-
-        # Determine CLI invocation based on pipeline type
-        from webgui.services.user_pipelines import is_user_pipeline, get_user_pipeline_id
-
         try:
+            cli_config = _build_cli_config(record.pipeline_settings, job_id)
+
+            _CONFIG_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+            _LOGS_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+            log_file = get_log_file(job_id)
+            # For built-in pipelines, inject export dir if applicable
+            _inject_export_directory(cli_config, job_id)
+            _write_config_file(config_file, cli_config)
+
+            log_level = record.pipeline_settings.get("_log_level", "INFO")
+
+            # Determine CLI invocation based on pipeline type
+            from webgui.services.user_pipelines import is_user_pipeline, get_user_pipeline_id
+
             smart_albums_bin = str(Path(sys.executable).parent / "smart-albums")
 
             if is_user_pipeline(record.pipeline):
@@ -350,6 +456,11 @@ async def _run_job(job_id: str) -> None:
                     "--progress-json",
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
+                    limit=_STREAM_LINE_LIMIT,
+                    # Own process group so cancel_job() can kill the whole
+                    # tree (the CLI and anything it spawns), not just this
+                    # direct child.
+                    start_new_session=True,
                 )
             else:
                 # Built-in pipeline: use the pipeline name as command
@@ -361,6 +472,8 @@ async def _run_job(job_id: str) -> None:
                     "--progress-json",
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
+                    limit=_STREAM_LINE_LIMIT,
+                    start_new_session=True,
                 )
 
             state.running_processes[job_id] = proc
@@ -368,8 +481,39 @@ async def _run_job(job_id: str) -> None:
             output_lines: list[str] = []
             _log_update_counter = 0
             assert proc.stdout is not None
-            with open(log_file, "w", encoding="utf-8") as lf:
-                async for line in proc.stdout:
+            # buffering=1 (line-buffered) rather than flushing explicitly
+            # after every line — flush() is itself a blocking syscall, and
+            # doing it on every single stdout line from the subprocess
+            # (which can be thousands for a large pipeline run) adds up to
+            # real time spent blocking the event loop (WG-21). Line
+            # buffering keeps the log file reasonably current on disk
+            # without a syscall per line.
+            with open(log_file, "w", encoding="utf-8", buffering=1) as lf:
+                # readline() (which `async for` on StreamReader uses) can
+                # still raise LimitOverrunError/IncompleteReadError for a
+                # single line longer than `limit` even with `limit` raised
+                # generously above. Read defensively so one oversized line
+                # (e.g. a huge traceback) fails that read instead of
+                # silently leaving the subprocess's pipe undrained, which
+                # would otherwise block the child forever once its stdout
+                # buffer fills up.
+                while True:
+                    try:
+                        line = await proc.stdout.readline()
+                    except (asyncio.LimitOverrunError, ValueError) as exc:
+                        logger.warning(
+                            "Job %s: oversized output line, truncating: %s",
+                            job_id, exc,
+                        )
+                        # Drain and discard the rest of the oversized line
+                        # so the stream can resync on the next line.
+                        try:
+                            await proc.stdout.read(_STREAM_LINE_LIMIT)
+                        except Exception:
+                            pass
+                        continue
+                    if not line:
+                        break
                     decoded = line.decode("utf-8", errors="replace")
 
                     if decoded.startswith(PROGRESS_PREFIX):
@@ -397,17 +541,54 @@ async def _run_job(job_id: str) -> None:
 
             await proc.wait()
 
-            if proc.returncode == 0:
+            if job_id in _cancelled_jobs:
+                # cancel_job() already sent the signal; make sure the
+                # final status says "cancelled" rather than reporting
+                # whatever exit code the killed process happened to exit
+                # with (e.g. "Process exited with code -15"), and rather
+                # than reporting "completed" if the CLI caught SIGTERM and
+                # exited 0 on its own.
+                record.status = JobStatus.failed
+                record.error = "Cancelled by user"
+            elif proc.returncode == 0:
                 record.status = JobStatus.completed
             else:
                 record.status = JobStatus.failed
                 record.error = f"Process exited with code {proc.returncode}"
 
         except Exception as exc:
-            record.status = JobStatus.failed
-            record.error = str(exc)
-            logger.exception("Job %s failed", job_id)
+            if job_id in _cancelled_jobs:
+                record.status = JobStatus.failed
+                record.error = "Cancelled by user"
+            else:
+                record.status = JobStatus.failed
+                record.error = str(exc)
+                logger.exception("Job %s failed", job_id)
         finally:
+            # If a subprocess was started but is still alive at this point
+            # (an exception was raised while streaming output, or the job
+            # was cancelled), make sure it doesn't outlive this task. Left
+            # unattended, an orphaned child with a full stdout pipe and no
+            # reader blocks forever. Kills the whole process group (see
+            # start_new_session=True above), not just the direct child.
+            if proc is not None and proc.returncode is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError, OSError):
+                    proc.terminate()
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=_PROCESS_KILL_TIMEOUT_SECONDS)
+                except asyncio.TimeoutError:
+                    logger.warning("Job %s: process did not exit after terminate(); killing", job_id)
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError, OSError):
+                        proc.kill()
+                    await proc.wait()
+                except ProcessLookupError:
+                    pass
+
+            _cancelled_jobs.discard(job_id)
             record.completed_at = datetime.now(timezone.utc)
             record.progress = None
             await state.db.update_job(record)

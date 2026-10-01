@@ -20,7 +20,7 @@ from typing import Any, Optional
 import typer
 from rich.console import Console
 
-from smart_albums.cli.config import configure_logging, load_json_file
+from smart_albums.cli.config import configure_logging, load_config_file, load_json_file
 from smart_albums.cli.execution import execute_pipeline
 from smart_albums.cli.imports import import_all_stages, import_clients
 from smart_albums.core.node import ConfigParam
@@ -206,8 +206,25 @@ def _build_run_pipeline(pipeline_info: PipelineInfo) -> Any:
         log_file: Optional[Path] = kwargs.pop("log_file", None)
         progress_json: bool = kwargs.pop("progress_json", False)
 
-        # Load config file
-        cfg = load_json_file(config_path) if config_path.exists() else {}
+        # Load config file (JSON or YAML, selected by extension — see
+        # load_config_file). The CLI's default of "no config file, use
+        # defaults" is preserved only for the *unspecified* default path
+        # (``config.json``). If the user explicitly points --config (or
+        # SMART_ALBUMS_CONFIG) at a path that doesn't exist, that's an error,
+        # not a cue to silently run the whole pipeline — including the
+        # publish stage — with built-in defaults (CO-12). A classic trigger
+        # is a Docker config mount that didn't land where expected.
+        _DEFAULT_CONFIG = Path("config.json")
+        if config_path.exists():
+            cfg = load_config_file(config_path)
+        elif config_path != _DEFAULT_CONFIG:
+            raise typer.BadParameter(
+                f"Config file not found: {config_path}. "
+                "Pass an existing --config path, or omit --config to run with defaults.",
+                param_hint="--config",
+            )
+        else:
+            cfg = {}
         # Config file log_level overrides default but CLI flag takes priority
         if log_level == "INFO" and "log_level" in cfg:
             log_level = cfg["log_level"]
@@ -369,7 +386,7 @@ def run_command(
       ]
     }
     """
-    cfg = load_json_file(config)
+    cfg = load_config_file(config)
 
     # Extract and validate pipeline definition
     raw_pipeline = cfg.pop("pipeline", None)

@@ -28,11 +28,13 @@ from webgui.services import jobs as jobs_service
 from webgui.services import pipelines as pipelines_service
 from webgui.services import presets as presets_service
 from webgui.services import prompts as prompts_service
+from webgui.services.template_vars import (
+    TEMPLATE_PATTERN as _TEMPLATE_PATTERN,
+    find_undefined_variables as _find_undefined_variables,
+    resolve_template_variables as _resolve_variables,
+)
 
 logger = logging.getLogger(__name__)
-
-# Pattern matching a single {VAR_NAME} placeholder (used across validation and resolution)
-_TEMPLATE_PATTERN = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 # Pattern matching a valid variable name (without braces)
 _VAR_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -167,11 +169,20 @@ def _render_param(param: dict[str, Any], vars_getter: Callable[[], dict[str, str
     elif kind == "prompt_file":
         prompts = prompts_service.list_prompts()
         options = {p.name: p.label for p in prompts}
+        # A saved preset/default can reference a prompt file that was since
+        # renamed or deleted. `ui.select(value=...)` raises ValueError for
+        # a value not in `options`, which crashed the whole form render
+        # instead of just leaving the field unset (WG-27).
+        safe_default = default if default in options else None
         element = ui.select(
             options=options,
-            value=default,
+            value=safe_default,
             label=label,
         ).classes("w-full").props("outlined dense clearable")
+        if default and safe_default is None:
+            ui.label(
+                f"⚠ Prompt '{default}' no longer exists — choose another."
+            ).classes("text-caption text-warning")
 
     elif kind == "bool":
         element = ui.switch(label, value=bool(default) if default is not None else False)
@@ -334,66 +345,24 @@ def _apply_settings(
     for section in sections:
         alias_settings = pipeline_settings.get(section["full_alias"], {})
         for field in section["fields"]:
-            if field.key in alias_settings:
-                field.element.value = alias_settings[field.key]
+            if field.key not in alias_settings:
+                continue
+            saved_value = alias_settings[field.key]
+            # A select/prompt_file field's `.value` setter validates against
+            # its current `options` — a preset saved before a choice/prompt
+            # was removed would otherwise raise ValueError here and crash
+            # the whole preset-load flow instead of just leaving that one
+            # field unset (WG-27).
+            options = getattr(field.element, "options", None)
+            if options is not None and saved_value not in options:
+                logger.warning(
+                    "Preset value %r for %s.%s is not a valid option; skipping",
+                    saved_value, section["full_alias"], field.key,
+                )
+                continue
+            field.element.value = saved_value
         # Recurse into children
         _apply_settings(section["children"], pipeline_settings)
-
-
-# ---------------------------------------------------------------------------
-# Template variable resolution
-# ---------------------------------------------------------------------------
-
-
-def _resolve_variables(
-    pipeline_settings: dict[str, dict[str, Any]],
-    variables: dict[str, str],
-) -> dict[str, dict[str, Any]]:
-    """Replace {VAR} placeholders in all string values within pipeline_settings.
-
-    Only replaces variables that are defined in the variables dict.
-    Unresolved placeholders are left as-is.
-
-    Note: Only resolves one level deep (alias → flat key/value dict).
-    Nested dict values are not recursed into.
-    """
-    if not variables:
-        return pipeline_settings
-
-    def _substitute(value: Any) -> Any:
-        if isinstance(value, str):
-            def _replace(m: re.Match) -> str:
-                var_name = m.group(1)
-                return variables.get(var_name, m.group(0))
-            return _TEMPLATE_PATTERN.sub(_replace, value)
-        return value
-
-    resolved: dict[str, dict[str, Any]] = {}
-    for alias, settings in pipeline_settings.items():
-        if isinstance(settings, dict):
-            resolved[alias] = {k: _substitute(v) for k, v in settings.items()}
-        else:
-            resolved[alias] = _substitute(settings)
-    return resolved
-
-
-def _find_undefined_variables(
-    pipeline_settings: dict[str, Any],
-    variables: dict[str, str],
-) -> set[str]:
-    """Return the set of {VAR} names used in settings that are not defined in variables."""
-    defined = set(variables.keys())
-    used: set[str] = set()
-
-    for _alias, settings in pipeline_settings.items():
-        if isinstance(settings, dict):
-            for v in settings.values():
-                if isinstance(v, str):
-                    used.update(_TEMPLATE_PATTERN.findall(v))
-        elif isinstance(settings, str):
-            used.update(_TEMPLATE_PATTERN.findall(settings))
-
-    return used - defined
 
 
 # ---------------------------------------------------------------------------
@@ -650,42 +619,104 @@ async def new_job_page() -> None:
                 label="Log Level",
             ).classes("w-64").props("outlined dense")
 
+        def _validate_all_fields(sections: list[dict[str, Any]]) -> bool:
+            """Run each field's NiceGUI ``validation=`` rules and report failures.
+
+            Previously the ``validation=`` dicts attached in ``_render_param``
+            only showed a red error message under the field — ``submit()``
+            never checked the result, so it ran (and could start a job)
+            against invalid input regardless (WG-27).
+            """
+            all_valid = True
+            for section in sections:
+                for field in section["fields"]:
+                    validate = getattr(field.element, "validate", None)
+                    if callable(validate) and not validate():
+                        all_valid = False
+                if not _validate_all_fields(section["children"]):
+                    all_valid = False
+            return all_valid
+
+        def _cast_resolved_numeric_fields(
+            sections: list[dict[str, Any]], settings: dict[str, Any]
+        ) -> None:
+            """Cast resolved {VAR} placeholders back to the field's numeric type.
+
+            A template placeholder in an int/float field (e.g. ``{YEAR}``)
+            passes through ``_FormField.value()`` as the literal string
+            ``"{YEAR}"`` so it survives collection; after
+            ``resolve_template_variables`` substitutes the real value it's
+            still a Python ``str`` (e.g. ``"2024"``) unless cast back,
+            producing a str where the pipeline stage expects an int/float
+            (WG-27).
+            """
+            for section in sections:
+                alias_settings = settings.get(section["full_alias"])
+                if isinstance(alias_settings, dict):
+                    for field in section["fields"]:
+                        if field.kind not in ("int", "int_optional", "float"):
+                            continue
+                        value = alias_settings.get(field.key)
+                        if not isinstance(value, str) or not _is_numeric(value):
+                            continue
+                        try:
+                            alias_settings[field.key] = (
+                                int(value) if field.kind != "float" else float(value)
+                            )
+                        except (TypeError, ValueError):
+                            pass
+                _cast_resolved_numeric_fields(section["children"], settings)
+
         # Submit button
         async def submit() -> None:
-            pipeline_settings = _collect_values(current_sections)
-            pipeline_name = pipeline_select.value
-
-            # Verify all {VAR} references are defined in the variables table
-            variables = template_vars_editor.get_variables()
-            undefined = _find_undefined_variables(pipeline_settings, variables)
-            if undefined:
-                names = ", ".join(f"{{{v}}}" for v in sorted(undefined))
-                ui.notify(
-                    f"Undefined template variables: {names}",
-                    type="negative",
-                )
+            # Guard against double-submit: a slow network or a double-click
+            # before the button visually disables could otherwise fire this
+            # handler twice and start two identical jobs (WG-23).
+            if submit_btn.props.get("disable"):
                 return
-
-            # Resolve template variables in settings
-            if variables:
-                pipeline_settings = _resolve_variables(pipeline_settings, variables)
-
-            # Inject log level after variable resolution (not a user-configurable template field)
-            pipeline_settings["_log_level"] = log_level_select.value
-
-            logger.info(
-                "Submitting job: pipeline=%s settings=%s",
-                pipeline_name, pipeline_settings,
-            )
+            submit_btn.props("disable loading")
             try:
-                record = await jobs_service.create_job(pipeline_name, pipeline_settings)
-                ui.notify(f"Job {record.id} started", type="positive")
-                ui.navigate.to("/jobs")
-            except Exception as exc:
-                logger.exception("Failed to start job")
-                ui.notify(f"Failed: {exc}", type="negative")
+                if not _validate_all_fields(current_sections):
+                    ui.notify("Fix the highlighted fields before submitting.", type="negative")
+                    return
+
+                pipeline_settings = _collect_values(current_sections)
+                pipeline_name = pipeline_select.value
+
+                # Verify all {VAR} references are defined in the variables table
+                variables = template_vars_editor.get_variables()
+                undefined = _find_undefined_variables(pipeline_settings, variables)
+                if undefined:
+                    names = ", ".join(f"{{{v}}}" for v in sorted(undefined))
+                    ui.notify(
+                        f"Undefined template variables: {names}",
+                        type="negative",
+                    )
+                    return
+
+                # Resolve template variables in settings
+                if variables:
+                    pipeline_settings = _resolve_variables(pipeline_settings, variables)
+                    _cast_resolved_numeric_fields(current_sections, pipeline_settings)
+
+                # Inject log level after variable resolution (not a user-configurable template field)
+                pipeline_settings["_log_level"] = log_level_select.value
+
+                logger.info(
+                    "Submitting job: pipeline=%s settings=%s",
+                    pipeline_name, pipeline_settings,
+                )
+                try:
+                    record = await jobs_service.create_job(pipeline_name, pipeline_settings)
+                    ui.notify(f"Job {record.id} started", type="positive")
+                    ui.navigate.to("/jobs")
+                except Exception as exc:
+                    logger.exception("Failed to start job")
+                    ui.notify(f"Failed: {exc}", type="negative")
+            finally:
+                submit_btn.props(remove="disable loading")
 
         with ui.row().classes("w-full justify-end"):
-            ui.button("Start job", icon="play_arrow", on_click=submit).props(
+            submit_btn = ui.button("Start job", icon="play_arrow", on_click=submit).props(
                 "color=primary"
             )

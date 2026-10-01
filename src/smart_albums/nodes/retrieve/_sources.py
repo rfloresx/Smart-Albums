@@ -39,9 +39,16 @@ class YearSource:
         self.year = year
 
     async def fetch(self, client: IImageClient, run_date: date) -> list[Asset]:
-        """Retrieve assets captured within the configured calendar year."""
+        """Retrieve assets captured within the configured calendar year.
+
+        Uses an exclusive ``< Jan 1 of next year`` upper bound rather than
+        ``Dec 31 23:59:59``. The old end bound dropped any asset captured in
+        the final second of the year with sub-second precision (e.g.
+        23:59:59.5), since that timestamp is strictly greater than
+        23:59:59.000000 (ND-14).
+        """
         taken_after = datetime(self.year, 1, 1, 0, 0, 0)
-        taken_before = datetime(self.year, 12, 31, 23, 59, 59)
+        taken_before = datetime(self.year + 1, 1, 1, 0, 0, 0)
         return await client.search_assets(taken_after, taken_before)
 
 
@@ -53,9 +60,16 @@ class DateRangeSource:
         self.to_date = to_date
 
     async def fetch(self, client: IImageClient, run_date: date) -> list[Asset]:
-        """Retrieve assets captured within the configured date range."""
+        """Retrieve assets captured within the configured date range.
+
+        The upper bound is exclusive — the day *after* ``to_date`` at
+        midnight — so an asset captured in the last sub-second of
+        ``to_date`` is still included (``time.max`` is 23:59:59.999999,
+        which excludes anything strictly later within that final second).
+        See ND-14.
+        """
         taken_after = datetime.combine(self.from_date, time.min)
-        taken_before = datetime.combine(self.to_date, time.max)
+        taken_before = datetime.combine(self.to_date + timedelta(days=1), time.min)
         return await client.search_assets(taken_after, taken_before)
 
 
@@ -79,6 +93,13 @@ class RecentSource:
             raise ValueError(
                 "RecentSource requires exactly one of 'days', 'weeks', or 'months'"
             )
+        # A zero or negative window is almost certainly a config mistake —
+        # it would produce an empty or inverted date range (start >= end),
+        # silently returning no assets. Reject it up front (ND-15).
+        if provided[0] <= 0:
+            raise ValueError(
+                "RecentSource window ('days'/'weeks'/'months') must be a positive integer"
+            )
         self.days = days
         self.weeks = weeks
         self.months = months
@@ -93,9 +114,14 @@ class RecentSource:
         return run_date - timedelta(days=(self.months or 0) * 30)
 
     async def fetch(self, client: IImageClient, run_date: date) -> list[Asset]:
-        """Retrieve assets captured within the rolling recent window."""
+        """Retrieve assets captured within the rolling recent window.
+
+        The upper bound is exclusive (midnight at the start of the day
+        *after* ``run_date``) so assets captured in the last sub-second of
+        ``run_date`` aren't dropped (ND-14).
+        """
         taken_after = datetime.combine(self._start_date(run_date), time.min)
-        taken_before = datetime.combine(run_date, time.max)
+        taken_before = datetime.combine(run_date + timedelta(days=1), time.min)
         return await client.search_assets(taken_after, taken_before)
 
 

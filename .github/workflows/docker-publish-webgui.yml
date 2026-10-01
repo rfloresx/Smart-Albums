@@ -1,15 +1,20 @@
 name: Build and Publish WebGUI Docker Image
 
+# Previously this ran directly on every push to main, so a broken commit
+# published a `latest` image before CI had a chance to fail (DK-06). It now
+# runs:
+#   * after the CI workflow completes on main (and only if CI succeeded —
+#     see the job-level `if` below), so `latest` only ever reflects a
+#     green commit;
+#   * on version tags (release builds); and
+#   * manually via workflow_dispatch.
 on:
   workflow_dispatch:
-  push:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
     branches: [main]
-    paths:
-      - "src/**"
-      - "pyproject.toml"
-      - "prompts/**"
-      - "Dockerfile.webgui"
-      - ".github/workflows/**"
+  push:
     tags:
       - "v*"
 
@@ -19,6 +24,10 @@ env:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
+    # For the workflow_run trigger, only publish when CI actually passed.
+    # workflow_dispatch and tag pushes don't set workflow_run, so the
+    # second clause lets those through unconditionally.
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     permissions:
       contents: read
       packages: write

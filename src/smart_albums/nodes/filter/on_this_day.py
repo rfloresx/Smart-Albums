@@ -32,8 +32,12 @@ class FilterOnThisDay(Stage):
             raise RuntimeError("image_client is required for stage 'filter.on_this_day'")
         fetched = await image_client.search_on_this_day(run_date)
 
-        in_context = {a.id for a in pre_filter}
-        candidates = [a for a in fetched if a.id in in_context]
+        # Keep the context's own Asset objects, not the fresh objects the
+        # search API returns — see ND-03 in the code review. Using
+        # `fetched` directly would silently drop every bit of upstream
+        # metadata (score, phash, embedding, ...) for matched assets.
+        by_id = {a.id: a for a in pre_filter}
+        candidates = [by_id[a.id] for a in fetched if a.id in by_id]
 
         ctx.assets = handle_empty_pool(self, ctx, candidates, pre_filter, photo_count)
         ctx.stats["filter.on_this_day.kept"] = len(ctx.assets)

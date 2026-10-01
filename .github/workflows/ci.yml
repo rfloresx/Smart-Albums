@@ -21,11 +21,42 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      # Install every optional extra so webgui/geo/heif imports are actually
+      # exercised in CI, not just the core + openai + huggingface set the
+      # old workflow installed (DK-06). ruff/coverage are added for the lint
+      # and coverage steps below.
       - name: Install dependencies
-        run: pip install -e ".[dev,openai,huggingface]"
+        run: pip install -e ".[dev,openai,huggingface,webgui,geo,heif]" ruff coverage
 
-      - name: Run tests
-        run: pytest --tb=short -q
+      # Lint gate: pyflakes (F) is enforced — it catches unused imports and
+      # undefined names, the highest-signal, lowest-false-positive class.
+      # CI had no lint step at all before (DK-06).
+      - name: Lint (pyflakes, enforced)
+        run: ruff check --select F src/
 
+      # Broader bug-prone checks (bugbear + async-blocking). Reported but
+      # non-blocking for now because the codebase still carries pre-existing
+      # findings here; tighten to a hard gate as they're worked down.
+      - name: Lint (bugbear + async, advisory)
+        continue-on-error: true
+        run: ruff check --select B,ASYNC src/
+
+      - name: Run tests with coverage
+        run: |
+          coverage run -m pytest --tb=short -q
+          coverage report
+          coverage xml
+
+      # Type-check BOTH packages. The old workflow only checked
+      # smart_albums/; webgui was never type-checked in CI even though it
+      # passes locally (DK-06).
       - name: Run type checking
-        run: mypy --python-version ${{ matrix.python-version }} src/smart_albums/
+        run: mypy --python-version ${{ matrix.python-version }} src/smart_albums/ src/webgui/
+
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.python-version }}
+          path: coverage.xml
+          if-no-files-found: ignore

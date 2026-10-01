@@ -6,54 +6,37 @@ for computing vector embeddings from raw image bytes.
 
 from __future__ import annotations
 
-import base64
 import logging
 
 import httpx
-from tenacity import (
-    before_sleep_log,
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
 from protocols_system import ProtocolsRegistry
 from protocols_system.protocols import IEmbeddingClient, IHealthCheck
 
 logger = logging.getLogger(__name__)
 
-
-_retry_policy = retry(
-    retry=retry_if_exception_type((httpx.ConnectError, httpx.TimeoutException)),
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=10),
-    before_sleep=before_sleep_log(logger, logging.WARNING),
-    reraise=True,
-)
+# NOTE: embed()/embed_batch() below always raise NotImplementedError — see
+# their docstrings (CL-02 in the code review). Ollama's /api/embed endpoint
+# embeds text, not images; there is no retry policy here because there is
+# no request to retry. The httpx client lifecycle (__aenter__/close) and
+# health_check() are kept so this class can still report a real connection
+# health check for this provider slot even though embedding itself is
+# unsupported.
 
 
 @ProtocolsRegistry.register("ollama_v2", IEmbeddingClient)
 @ProtocolsRegistry.register("ollama_v2", IHealthCheck)
 class OllamaEmbeddingClient:
-    """Async embedding client using the Ollama REST API.
+    """Registered IEmbeddingClient provider for Ollama — currently unsupported.
 
-    Implements the IEmbeddingClient protocol by sending base64-encoded image
-    bytes to the Ollama `/api/embed` endpoint and returning the resulting
-    embedding vector.
+    This class is registered under the "ollama_v2" provider slot for
+    IEmbeddingClient, but ``embed()``/``embed_batch()`` always raise
+    ``NotImplementedError``: Ollama's ``/api/embed`` endpoint embeds text,
+    not images (see CL-02 in the code review). Selecting this provider for
+    image embeddings will fail loudly rather than silently producing
+    meaningless vectors, which is what happened before this fix.
 
-    Supports async context manager protocol for httpx client lifecycle
-    management.
-
-    Usage::
-
-        async with OllamaEmbeddingClient(
-            model="mxbai-embed-large",
-            base_url="http://localhost:11434",
-        ) as client:
-            embedding = await client.embed(image_bytes)
-
-    Can also be used without a context manager — the httpx client is
-    created lazily on first use.
+    ``health_check()`` still works, since checking connectivity to the
+    Ollama server doesn't require embedding an image.
     """
 
     def __init__(
@@ -106,42 +89,31 @@ class OllamaEmbeddingClient:
     # Public API
     # ------------------------------------------------------------------
 
-    @_retry_policy
     async def embed(self, image_bytes: bytes) -> list[float]:
-        """Compute an embedding vector for the given image bytes.
+        """Raise: Ollama's ``/api/embed`` endpoint embeds text, not images.
 
-        Sends base64-encoded image bytes to the Ollama embed endpoint and
-        returns the first embedding vector from the response.
-
-        Args:
-            image_bytes: Raw image bytes (JPEG, PNG, etc.).
-
-        Returns:
-            The embedding vector as a list of floats.
+        This method used to base64-encode ``image_bytes`` and POST it to
+        ``/api/embed`` as the ``input`` field, but that endpoint treats
+        ``input`` as text to run through the embedding model (e.g.
+        ``mxbai-embed-large``, a text-only model) — it would embed the
+        *base64 string itself* as text. That call succeeds and returns a
+        well-formed vector, so nothing ever errored; every downstream
+        cosine-similarity comparison (near-duplicate detection, scene
+        clustering, diverse selection) silently operated on noise with no
+        relationship to the image's actual visual content.
 
         Raises:
-            httpx.ConnectError: If the Ollama server is unreachable (retried).
-            httpx.TimeoutException: If the request times out (retried).
-            httpx.HTTPStatusError: If the server returns a non-2xx status.
-            ValueError: If the response does not contain valid embeddings.
+            NotImplementedError: Always. Use a real image-embedding
+                provider instead (``huggingface``, ``image_embedding``), or
+                caption the image with a vision model first and embed the
+                resulting text.
         """
-        encoded = base64.b64encode(image_bytes).decode("utf-8")
-        client = self._get_client()
-
-        response = await client.post(
-            "/api/embed",
-            json={"model": self._model, "input": encoded},
+        raise NotImplementedError(
+            "Ollama's /api/embed endpoint embeds text, not images — sending "
+            "a base64-encoded image as text silently produces meaningless "
+            "vectors rather than an error. Use a dedicated image-embedding "
+            "provider (huggingface, image_embedding) instead."
         )
-        response.raise_for_status()
-
-        data = response.json()
-        embeddings = data.get("embeddings")
-        if not embeddings or not embeddings[0]:
-            raise ValueError(
-                f"Ollama embed response missing embeddings: {data}"
-            )
-
-        return [float(x) for x in embeddings[0]]
 
     async def close(self) -> None:
         """Close the underlying httpx client and release resources."""
@@ -153,28 +125,13 @@ class OllamaEmbeddingClient:
         self,
         image_bytes_list: list[bytes],
     ) -> list[list[float] | None]:
-        """Compute embedding vectors for a list of images sequentially.
-
-        The Ollama REST API does not support true batched image embedding,
-        so this calls embed() for each image individually. Images that fail
-        are returned as None at their original index.
-
-        Args:
-            image_bytes_list: Raw image bytes for each image to embed.
-
-        Returns:
-            A list of the same length as ``image_bytes_list``. Each entry is
-            either a ``list[float]`` embedding vector, or ``None`` if that
-            image failed.
-        """
-        results: list[list[float] | None] = []
-        for image_bytes in image_bytes_list:
-            try:
-                embedding = await self.embed(image_bytes)
-                results.append(embedding)
-            except Exception:
-                results.append(None)
-        return results
+        """Raise: see ``embed()`` — Ollama's embed endpoint doesn't do images."""
+        raise NotImplementedError(
+            "Ollama's /api/embed endpoint embeds text, not images — sending "
+            "a base64-encoded image as text silently produces meaningless "
+            "vectors rather than an error. Use a dedicated image-embedding "
+            "provider (huggingface, image_embedding) instead."
+        )
 
     @property
     def health_check_url(self) -> str:

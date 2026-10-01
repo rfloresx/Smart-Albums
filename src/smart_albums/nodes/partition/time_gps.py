@@ -7,6 +7,26 @@ time window OR the GPS distance exceeds the configured distance window.
 Both time AND GPS constraints must be satisfied for assets to remain in the
 same partition. Missing GPS coordinates on either asset are treated as
 infinite distance (always split).
+
+Semantics vs. ``partition.time_gps_anchor`` (ND-13)
+---------------------------------------------------
+This stage and ``partition.time_gps_anchor`` deliberately implement
+*different* clustering strategies; pick the one that matches your intent:
+
+- **This stage (sequential / "walk"):** compares each asset only against
+  the *previous* asset in time order. A group can therefore drift
+  arbitrarily far over a sequence of small steps (A near B, B near C, C
+  near D, ... even if A and D are far apart). Any asset *missing* GPS
+  always starts a new partition (treated as infinite distance). Best when
+  you want to segment a continuous timeline/track into legs and GPS is
+  reliably present.
+
+- **``time_gps_anchor`` (anchored):** first clusters purely by time, then
+  within each time cluster sub-partitions by GPS against a fixed *anchor*
+  per sub-group (bounding how far a group can spread), and keeps
+  GPS-less assets together within their time cluster rather than
+  splitting each into its own partition. Best for "same place, same
+  time" event grouping, especially when some photos lack GPS.
 """
 
 from __future__ import annotations
@@ -18,6 +38,7 @@ from smart_albums.core.context import PipelineContext, ContextBatch
 from protocols_system.protocols import Asset
 from smart_albums.core.node import Stage, ConfigParam
 from smart_albums.core.registry import stage
+from smart_albums.utils.datetime_utils import to_aware_utc
 from smart_albums.utils.split import split_contexts
 
 
@@ -101,7 +122,9 @@ class PartitionTimeGps(Stage):
         if not timed_assets:
             return [ctx]
 
-        sorted_assets = sorted(timed_assets, key=lambda a: (a.captured_at, a.id))
+        # Normalize to aware-UTC so a mix of naive and aware captured_at
+        # values doesn't raise TypeError on comparison/subtraction (ND-14).
+        sorted_assets = sorted(timed_assets, key=lambda a: (to_aware_utc(a.captured_at), a.id))
 
         partitions: list[list[Asset]] = [[sorted_assets[0]]]
         for asset in sorted_assets[1:]:
@@ -110,7 +133,7 @@ class PartitionTimeGps(Stage):
             if asset.captured_at is None or prev.captured_at is None:
                 partitions.append([asset])
                 continue
-            time_ok = (asset.captured_at - prev.captured_at) <= time_window
+            time_ok = (to_aware_utc(asset.captured_at) - to_aware_utc(prev.captured_at)) <= time_window
             gps_ok = _gps_within(prev, asset, gps_window)
 
             if time_ok and gps_ok:

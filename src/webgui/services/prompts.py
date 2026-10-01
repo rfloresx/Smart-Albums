@@ -104,6 +104,22 @@ def _safe_path(name: str) -> Path:
     return candidate
 
 
+def resolve_prompt_path(name: str) -> Path:
+    """Public wrapper around :func:`_safe_path` for other services to use.
+
+    Resolves a prompt filename (as stored in ``pipeline_settings['score']
+    ['prompt_file']``) to an absolute path confined to ``prompts_dir``.
+    Used by ``services/jobs.py`` when building the CLI config for a job, so
+    a crafted or malformed ``prompt_file`` value can't make the CLI read an
+    arbitrary file on the host (see services/jobs.py's _build_cli_config).
+
+    Raises:
+        PromptError: If the name is empty, absolute, contains a path
+            separator, or otherwise resolves outside ``prompts_dir``.
+    """
+    return _safe_path(name)
+
+
 def list_prompts() -> list[PromptInfo]:
     """Return all prompt files, sorted by name.
 

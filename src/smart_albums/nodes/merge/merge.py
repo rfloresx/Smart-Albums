@@ -6,11 +6,35 @@ assets from branch contexts and flattens stats via summation/concatenation.
 
 from __future__ import annotations
 
-from typing import Any
+import logging
+from typing import Any, Optional
 
 from smart_albums.core.context import ContextBatch, PipelineContext
 from smart_albums.core.node import PipelineNode
 from smart_albums.core.registry import stage
+
+logger = logging.getLogger(__name__)
+
+# split_contexts() (smart_albums.utils.split) builds each child's
+# partition_id as f"{parent_id}__{partition_name}_{i}", chaining parent ids
+# together with this separator. Partition/stage names in this codebase use
+# single underscores (e.g. "time_gps", "time_gps_anchor"), never "__", so
+# splitting on the *last* occurrence of "__" reliably recovers the
+# grandparent id from a child id.
+_ID_SEPARATOR = "__"
+
+
+def _grandparent_id(partition_id: str) -> Optional[str]:
+    """Derive the grandparent partition id from a (possibly nested) id.
+
+    E.g. "evenly_0__time_0" -> "evenly_0" (one level up from "time_0",
+    which is itself one level up from the assets). A depth-1 id like
+    "evenly_0" has no encoded parent, so this returns None.
+    """
+    if not partition_id or _ID_SEPARATOR not in partition_id:
+        return None
+    parent, _, _ = partition_id.rpartition(_ID_SEPARATOR)
+    return parent or None
 
 
 def _flatten_stats(stats_list: list[dict[str, Any]]) -> dict[str, Any]:
@@ -46,7 +70,15 @@ def _flatten_stats(stats_list: list[dict[str, Any]]) -> dict[str, Any]:
         if not values:
             continue
 
-        if all(isinstance(v, (int, float)) for v in values):
+        # bool is a subclass of int, so a naive `isinstance(v, (int, float))`
+        # + sum() turned a flag like {"skipped_empty_pool": True} appearing
+        # in two branches into the integer 2 (ND-12). Treat all-bool values
+        # as a logical OR instead — "did this happen in any branch" is the
+        # meaningful aggregate for a boolean flag, and it preserves the bool
+        # type rather than silently promoting it to an int.
+        if all(isinstance(v, bool) for v in values):
+            result[key] = any(values)
+        elif all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in values):
             result[key] = sum(values)
         elif all(isinstance(v, list) for v in values):
             merged: list[Any] = []
@@ -54,7 +86,16 @@ def _flatten_stats(stats_list: list[dict[str, Any]]) -> dict[str, Any]:
                 merged.extend(v)
             result[key] = merged
         else:
-            # Non-mergeable: first occurrence wins
+            # Mixed/unmergeable types (including a bool mixed with ints).
+            # First occurrence wins, but log it: silently keeping the first
+            # value of a key whose type varies across branches hides a real
+            # inconsistency (ND-12).
+            if len({type(v) for v in values}) > 1:
+                logger.debug(
+                    "merge: stats key %r has mixed types across branches %r; "
+                    "keeping first value %r",
+                    key, [type(v).__name__ for v in values], values[0],
+                )
             result[key] = values[0]
 
     return result
@@ -78,6 +119,21 @@ def merge_concat(contexts: ContextBatch) -> PipelineContext:
 
     first = contexts[0]
 
+    # The merged context's own id becomes the parent id the branches shared
+    # (one level up), and *its* parent is derived from that id rather than
+    # hardcoded to None. Previously this always set parent_partition_id to
+    # None, which is only correct when merging the outermost partition
+    # level. With nested partitioning (e.g. an outer partition.evenly
+    # wrapping an inner dedup.scenes/dedup.similar composite), that made
+    # every intermediate merge collapse straight to "no parent" — the next
+    # merge level then grouped by parent_partition_id=None and silently
+    # fused contexts from *different* outer partitions into one, destroying
+    # the outer partitioning. See utils/split.py, which encodes the full
+    # lineage into each child's partition_id as "<parent_id>__<name>_<i>",
+    # making it possible to recover the grandparent id here.
+    merged_partition_id = first.parent_partition_id or ""
+    merged_parent_id = _grandparent_id(merged_partition_id)
+
     if len(contexts) == 1:
         # Single context — still reduce depth by one level
         return PipelineContext(
@@ -86,8 +142,8 @@ def merge_concat(contexts: ContextBatch) -> PipelineContext:
             stats=first.stats,
             metadata=first.metadata,
             partition_name=first.partition_name,
-            partition_id=first.parent_partition_id or "",
-            parent_partition_id=None,
+            partition_id=merged_partition_id,
+            parent_partition_id=merged_parent_id,
             partition_depth=max(0, first.partition_depth - 1),
         )
 
@@ -107,8 +163,8 @@ def merge_concat(contexts: ContextBatch) -> PipelineContext:
         stats=merged_stats,
         metadata=first.metadata,
         partition_name=first.partition_name,
-        partition_id=first.parent_partition_id or "",
-        parent_partition_id=None,
+        partition_id=merged_partition_id,
+        parent_partition_id=merged_parent_id,
         partition_depth=max(0, first.partition_depth - 1),
     )
 

@@ -6,19 +6,37 @@ services:
     container_name: smart-albums-gui
     restart: unless-stopped
     ports:
-      - "8080:8000"
+      # Bound to localhost by default. Change to "8080:8000" (all
+      # interfaces) only once you have set ADMIN_USERNAME/ADMIN_PASSWORD
+      # below, or set ALLOW_OPEN_SETUP=1 to accept an open first-run.
+      - "127.0.0.1:8080:8000"
     volumes:
       - ./config.yaml:/config/config.yaml:ro
       - smart-albums-cache:/data/cache
       - smart-albums-prompts:/data/prompts
       - smart-albums-exports:/data/exports
       - smart-albums-db:/data/db
+      # Persists downloaded HuggingFace models (only used with the
+      # "huggingface" embedding provider) across container recreates.
+      # Without this, HF_HOME (/data/hf_cache) is ephemeral and every
+      # recreate re-downloads the embedding model.
+      - smart-albums-hf-cache:/data/hf_cache
     environment:
       - CONFIG_PATH=/config/config.yaml
+      # Required: a stable secret key for signed session cookies. Generate
+      # one with `openssl rand -base64 32` and set it in a .env file next to
+      # this compose file, or export it in your shell. Leaving this empty
+      # invalidates all sessions on every restart.
       - STORAGE_SECRET=${STORAGE_SECRET:-}
-      # Authentication: set admin credentials for first-time setup
-      # - ADMIN_USERNAME=admin
-      # - ADMIN_PASSWORD=changeme
+      # Authentication: set admin credentials for first-time setup so the
+      # admin account is created automatically instead of being claimed by
+      # whoever visits /setup first.
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
+      # Only set this to 1 if you understand the risk: with no admin
+      # credentials above and the port exposed beyond 127.0.0.1, the first
+      # visitor to /setup becomes the admin.
+      - ALLOW_OPEN_SETUP=${ALLOW_OPEN_SETUP:-}
     # Optional: connect to the same network as Immich/Ollama
     # networks:
     #   - immich_default
@@ -28,3 +46,4 @@ volumes:
   smart-albums-prompts:
   smart-albums-exports:
   smart-albums-db:
+  smart-albums-hf-cache:

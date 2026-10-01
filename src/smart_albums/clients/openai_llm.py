@@ -25,6 +25,12 @@ from tenacity import (
 from protocols_system import ProtocolsRegistry
 from protocols_system.protocols import IHealthCheck, ILLMClient
 
+from smart_albums.clients._llm_support import (
+    ImageConversionError as _ImageConversionError,
+    prepare_image_for_vision as _prepare_image_for_vision,
+    validate_against_schema as _validate_against_schema,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -35,35 +41,6 @@ _retry_policy = retry(
     before_sleep=before_sleep_log(logger, logging.WARNING),
     reraise=True,
 )
-
-
-def _validate_against_schema(data: dict[str, Any], schema: dict[str, Any]) -> str | None:
-    """Validate a dict against a simplified JSON schema.
-
-    Returns None if valid, or an error message string if validation fails.
-    """
-    required_keys = schema.get("required", [])
-    properties = schema.get("properties", {})
-
-    for key in required_keys:
-        if key not in data:
-            return f"Missing required key: '{key}'"
-
-    for key, prop_schema in properties.items():
-        if key not in data:
-            continue
-        expected_type = prop_schema.get("type")
-        value = data[key]
-        if expected_type == "number" and not isinstance(value, (int, float)):
-            return f"Key '{key}' expected number, got {type(value).__name__}"
-        if expected_type == "string" and not isinstance(value, str):
-            return f"Key '{key}' expected string, got {type(value).__name__}"
-        if expected_type == "boolean" and not isinstance(value, bool):
-            return f"Key '{key}' expected boolean, got {type(value).__name__}"
-        if expected_type == "array" and not isinstance(value, list):
-            return f"Key '{key}' expected array, got {type(value).__name__}"
-
-    return None
 
 
 def _strip_markdown_fences(text: str) -> str:
@@ -199,31 +176,17 @@ class OpenAIClient:
         """
         from openai import APIConnectionError, APIStatusError, APITimeoutError
 
-        # Detect MIME type from magic bytes
-        if image_bytes[:4] == b'\x89PNG':
-            mime_type = "image/png"
-        elif image_bytes[:4] == b'RIFF' and image_bytes[8:12] == b'WEBP':
-            mime_type = "image/webp"
-        elif image_bytes[:2] == b'\xff\xd8':
-            mime_type = "image/jpeg"
-        else:
-            mime_type = "image/jpeg"  # fallback
-
-        # Convert WebP/unsupported formats to JPEG for compatibility
-        if mime_type not in ("image/jpeg", "image/png"):
-            try:
-                import io
-
-                from PIL import Image
-
-                img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-                buf = io.BytesIO()
-                img.save(buf, format="JPEG", quality=90)
-                image_bytes = buf.getvalue()
-                mime_type = "image/jpeg"
-                logger.debug("Converted image to JPEG (%d bytes)", len(image_bytes))
-            except Exception as exc:
-                logger.warning("Failed to convert image to JPEG: %s", exc)
+        # Normalize to JPEG/PNG. Previously only WebP was converted and
+        # every other non-JPEG/PNG format (HEIC/TIFF/BMP/GIF) was sent as
+        # ``data:image/jpeg`` carrying its original, non-JPEG bytes; a
+        # conversion failure logged a warning and sent the bad bytes anyway
+        # (CL-08). Now everything that isn't already JPEG/PNG is decoded,
+        # downscaled, and re-encoded, and an undecodable image returns a
+        # clean per-image error instead of being sent as garbage.
+        try:
+            image_bytes, mime_type = _prepare_image_for_vision(image_bytes)
+        except _ImageConversionError as exc:
+            return {"error": f"Image conversion failed: {exc}"}
 
         image_b64 = base64.b64encode(image_bytes).decode("ascii")
 

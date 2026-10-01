@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from smart_albums.core.context import PipelineContext, ContextBatch
-from smart_albums.core.node import PipelineNode, ConfigParam, CompositeParam
+from smart_albums.core.node import PipelineNode, CompositeParam
 from smart_albums.core.spec import Pipeline
 from smart_albums.core.registry import stage
 

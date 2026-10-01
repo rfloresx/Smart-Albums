@@ -12,7 +12,7 @@ import logging
 import os
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any
 
 from webgui.config import AppConfig, AuthConfig, load_config, providers_from_dict, resolve_provider_paths
 from webgui.database import Database
@@ -41,12 +41,18 @@ class AppState:
         await self.db.connect()
         await self.reload_providers()
 
-        # Mark any jobs stuck in "running" as failed (server restart)
+        # Mark any jobs stuck in "running" or "pending" as failed (server
+        # restart). Previously only "running" was handled; a job that was
+        # queued behind the concurrency semaphore (status "pending") when
+        # the process died had no in-memory task to resume it and no code
+        # path ever revisited it, so it stayed "pending" forever — showing
+        # up in the Jobs page indistinguishable from a job genuinely
+        # waiting for a free slot (WG-20).
         jobs = await self.db.list_jobs()
         for job in jobs:
-            if job.status == JobStatus.running:
+            if job.status in (JobStatus.running, JobStatus.pending):
                 job.status = JobStatus.failed
-                job.error = "Server restarted while job was running"
+                job.error = "Server restarted while job was running or queued"
                 job.completed_at = datetime.now(timezone.utc)
                 await self.db.update_job(job)
 

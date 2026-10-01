@@ -36,11 +36,47 @@ logger = logging.getLogger(__name__)
 
 
 def _is_transient(exc: BaseException) -> bool:
-    """Return True for errors worth retrying (5xx, network errors)."""
+    """Return True for errors worth retrying (429/5xx, network errors).
+
+    Two problems with the previous version of this check:
+
+    1. It retried *permanent* errors. Methods decorated with
+       ``@_retry_policy`` (get_asset_thumbnail, get_asset_full) translate a
+       404 ``NotFoundException`` into ``FileNotFoundError`` *inside* the
+       retried function body — and ``FileNotFoundError`` is an ``OSError``
+       subclass. ``isinstance(exc, (OSError, ConnectionError))`` therefore
+       matched it, so every request for a genuinely missing asset was
+       retried 3 times with exponential backoff (1-10s) before finally
+       giving up, despite the method's own docstring calling this "a
+       permanent condition; the caller should skip the asset rather than
+       retry". The same blanket ``OSError`` check also retried
+       ``PermissionError`` and other clearly non-transient OS errors.
+    2. It missed real transient errors that aren't ``OSError`` subclasses:
+       aiohttp's ``ClientConnectionError`` (the base class for connection
+       failures) and a generic 429 rate-limit response (which immichpy
+       surfaces as a plain ``ApiException`` with ``status=429``, not a
+       ``ServiceException`` — that class is reserved for 5xx) were never
+       retried at all.
+    """
+    if isinstance(exc, FileNotFoundError):
+        # A 404 translated to FileNotFoundError by a method body — see
+        # get_asset_thumbnail/get_asset_full. Permanent; never retry.
+        return False
+    if isinstance(exc, ApiException) and getattr(exc, "status", None) == 429:
+        # Rate limited — worth retrying with backoff.
+        return True
     if isinstance(exc, ServiceException):
+        # 5xx from the server.
         return True
-    if isinstance(exc, (OSError, ConnectionError)):
+    if isinstance(exc, (ConnectionError, TimeoutError)):
         return True
+    try:
+        import aiohttp
+
+        if isinstance(exc, aiohttp.ClientConnectionError):
+            return True
+    except ImportError:
+        pass
     return False
 
 
@@ -248,9 +284,16 @@ class ImmichClient:
         except ServiceException:
             raise
 
-    @_retry_policy
     async def create_album(self, name: str, asset_ids: list[str]) -> AlbumResult:
         """Create a new album with the given assets.
+
+        Deliberately NOT decorated with ``@_retry_policy``: POST
+        /albums is not idempotent. If the server successfully creates the
+        album but the response is lost to a dropped connection or a 5xx
+        (some proxies/servers can fail *after* committing the write), a
+        retry would create a second, duplicate album with the same name.
+        Instead, on any transient-looking failure, check whether an album
+        with this name now exists before giving up.
 
         Args:
             name: Album display name.
@@ -260,7 +303,8 @@ class ImmichClient:
             AlbumResult with id, name, and browser URL.
 
         Raises:
-            ConnectionError: On transient network errors after retries exhausted.
+            ConnectionError: On a transient network/server error where no
+                matching album could be found afterward either.
         """
         try:
             dto = CreateAlbumDto(
@@ -275,8 +319,24 @@ class ImmichClient:
             )
         except (UnauthorizedException, ForbiddenException):
             raise
-        except ServiceException:
-            raise
+        except Exception as exc:
+            if not _is_transient(exc):
+                raise
+            # The create call may or may not have actually gone through on
+            # the server. Check once, without retrying the create itself,
+            # whether the album now exists rather than blindly creating a
+            # duplicate.
+            existing = await self.get_album_by_name(name)
+            if existing is not None:
+                return AlbumResult(
+                    id=existing.id,
+                    name=existing.name,
+                    url=f"{self._base_url}/albums/{existing.id}",
+                )
+            raise ConnectionError(
+                f"Transient error creating album {name!r} and no matching "
+                f"album was found afterward: {exc}"
+            ) from exc
 
     @_retry_policy
     async def search_smart(self, query: str, limit: int) -> list[Asset]:
@@ -328,7 +388,14 @@ class ImmichClient:
     async def search_people_any(self) -> list[Asset]:
         """Return all assets that contain at least one recognized face.
 
-        Uses the Immich search API to find assets with person associations.
+        Uses the Immich search API and filters client-side on each asset's
+        ``people`` field, since ``MetadataSearchDto.with_people`` is not a
+        filter — per the Immich API docs, it only means "include people
+        data in the response". Passing ``with_people=True`` alone (as this
+        method previously did) returns the *entire* library, each asset
+        simply annotated with its (possibly empty) people list; nothing
+        was actually being filtered by "has at least one face" before this
+        fix.
 
         Returns:
             List of Asset objects containing recognized faces.
@@ -353,7 +420,8 @@ class ImmichClient:
                 raise
 
             for asset_dto in response.assets.items:
-                results.append(_map_asset(asset_dto))
+                if getattr(asset_dto, "people", None):
+                    results.append(_map_asset(asset_dto))
 
             if response.assets.next_page is None:
                 break

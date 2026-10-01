@@ -12,10 +12,11 @@ No network access required. Albums are stored as JSON entries in db.json.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import mimetypes
-from datetime import date, datetime, time
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
@@ -26,6 +27,8 @@ from protocols_system.protocols import (
     IHealthCheck,
     IImageClient,
 )
+
+from smart_albums.utils.datetime_utils import to_aware_utc
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +139,11 @@ class LocalImageClient:
         self._dirty: bool = False
 
     async def __aenter__(self) -> "LocalImageClient":
-        self._load_or_build_index()
+        # Index building does an rglob plus a synchronous Pillow EXIF open
+        # per file — potentially thousands of blocking filesystem+decode
+        # operations. Run it off the event loop so entering the client
+        # doesn't stall every other coroutine on a large library (CL-11).
+        await asyncio.to_thread(self._load_or_build_index)
         return self
 
     async def __aexit__(self, *args: object) -> None:
@@ -165,13 +172,23 @@ class LocalImageClient:
         taken_before: datetime,
         **kwargs: Any,
     ) -> list[Asset]:
-        """Return indexed assets whose captured_at falls within the date range."""
+        """Return indexed assets whose captured_at falls within the date range.
+
+        All three datetimes (the two bounds and each asset's captured_at)
+        are normalized to aware-UTC before comparison. The local client's
+        own timestamps are naive (from EXIF/mtime) while callers may pass
+        aware bounds (and the Immich client produces aware datetimes), so
+        comparing them directly used to raise ``TypeError: can't compare
+        offset-naive and offset-aware datetimes`` (CL-12).
+        """
+        after = to_aware_utc(taken_after)
+        before = to_aware_utc(taken_before)
         results: list[Asset] = []
         for asset_id, entry in self._db.get("assets", {}).items():
             captured_at = self._parse_dt(entry.get("captured_at"))
             if captured_at is None:
                 continue
-            if taken_after <= captured_at <= taken_before:
+            if after <= to_aware_utc(captured_at) <= before:
                 results.append(self._entry_to_asset(asset_id, entry))
         return results
 
@@ -190,13 +207,30 @@ class LocalImageClient:
 
         Raises:
             FileNotFoundError: If the file does not exist on disk.
+            ValueError: If ``asset_id`` resolves outside the assets dir.
         """
-        file_path = self._assets_dir / asset_id
+        file_path = self._resolve_asset_path(asset_id)
         if not file_path.is_file():
             raise FileNotFoundError(
                 f"Asset file not found: {file_path}"
             )
-        return file_path.read_bytes()
+        # read_bytes() is blocking disk I/O — run it off the event loop.
+        return await asyncio.to_thread(file_path.read_bytes)
+
+    def _resolve_asset_path(self, asset_id: str) -> Path:
+        """Resolve an asset id to a path confined to the assets directory.
+
+        ``self._assets_dir / asset_id`` was used directly, so an asset id
+        containing ``..`` or an absolute path escaped the assets directory
+        and could read any file the process can access (CL-11). This
+        resolves the candidate and confirms it stays under
+        ``self._assets_dir``.
+        """
+        base = self._assets_dir.resolve()
+        candidate = (self._assets_dir / asset_id).resolve()
+        if candidate != base and base not in candidate.parents:
+            raise ValueError(f"Refusing to access asset outside library: {asset_id!r}")
+        return candidate
 
     # ------------------------------------------------------------------
     # IImageClient — Album operations

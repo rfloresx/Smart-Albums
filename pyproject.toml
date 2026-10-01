@@ -36,10 +36,25 @@ dependencies = [
     "PyYAML>=6.0,<7",
     "faiss-cpu>=1.7.4,<2",
     "numpy>=1.24.0,<3",
-    "protocols-system @ git+https://github.com/rfloresx/ProtocolsSystem.git",
+    # Pinned to a specific commit rather than the default branch (CO-03):
+    # an unpinned git dependency means every build -- including CI and both
+    # Docker images -- re-resolves to whatever the upstream default branch
+    # currently points at. This project relies on ProtocolsRegistry's exact
+    # API (create/get_instance/set_instance/clear_instances), so an
+    # upstream change can silently break builds with no local diff to
+    # explain why. Bump this hash deliberately when picking up upstream
+    # changes.
+    "protocols-system @ git+https://github.com/rfloresx/ProtocolsSystem.git@77eb984c935593add1ccd91a126d7d8becaacb5b",
 ]
 
 [project.optional-dependencies]
+# HEIC/HEIF decoding support (iPhone photos). Optional because the pure
+# Python/Pillow install can't decode HEIC without it; when absent, the LLM
+# clients report a clear "pillow-heif not installed" error for HEIC input
+# instead of silently sending undecodable bytes (CL-08).
+heif = [
+    "pillow-heif>=0.16.0,<1",
+]
 huggingface = [
     "transformers>=4.38.0,<5",
     "torch>=2.0.0",
@@ -115,6 +130,26 @@ disable_error_code = ["no-untyped-call", "union-attr", "operator", "attr-defined
 [[tool.mypy.overrides]]
 module = "smart_albums.clients.immich"
 disable_error_code = ["call-arg", "arg-type", "attr-defined"]
+
+[tool.ruff]
+# Linting was previously not configured at all and not run in CI, so a
+# class of real bugs (unused imports, bare `raise` inside `except` losing
+# the cause, blocking calls in async functions) went uncaught (DK-06).
+# This config enables a focused, high-signal rule set rather than ruff's
+# full default, so the CI lint step is meaningful without drowning in
+# stylistic noise.
+src = ["src"]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "F",      # pyflakes: unused imports/variables, undefined names
+    "B",      # flake8-bugbear: likely bugs
+    "ASYNC",  # flake8-async: blocking calls in async code
+]
+# B008 (function call in default arg) fires on the Typer/NiceGUI
+# `x = typer.Option(...)` / `ui.*` idioms, which are intentional there.
+ignore = ["B008"]
 
 [tool.hatch.metadata]
 # Required to allow the git direct reference for protocols-system.

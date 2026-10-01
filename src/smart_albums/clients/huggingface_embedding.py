@@ -30,17 +30,24 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from protocols_system import ProtocolsRegistry
 from protocols_system.protocols import IEmbeddingClient, IHealthCheck
 
 if TYPE_CHECKING:
-    import torch
     from PIL import Image as PILImage
     from transformers import AutoModel, AutoProcessor
 
 logger = logging.getLogger(__name__)
+
+# Upper bound (width, height) for images decoded ahead of the embedding
+# forward pass. CLIP-family processors resize to a small fixed size anyway
+# (commonly 224x224), so there is no benefit to keeping a decoded image at
+# full camera resolution around in memory. 512x512 comfortably covers what
+# any current CLIP/SigLIP processor asks for while cutting per-image
+# decoded memory by one to two orders of magnitude versus a 24MP original.
+_DECODE_MAX_SIZE = (512, 512)
 
 
 def _check_dependencies() -> None:
@@ -128,6 +135,14 @@ class HuggingFaceEmbeddingClient:
         self._model: AutoModel | None = None
         self._processor: AutoProcessor | None = None
         self._has_get_image_features: bool = False
+        # Serializes forward passes on the shared model. The embed()/
+        # embed_batch() calls run their synchronous inference via
+        # asyncio.to_thread, so without a lock several of them could run
+        # concurrently against the single loaded model — risking VRAM OOM
+        # on GPU, MPS thread-safety issues on macOS, and CPU
+        # oversubscription on CPU (CL-10). Also guards close() so the model
+        # can't be nulled out from under an in-flight forward pass.
+        self._inference_lock = asyncio.Lock()
 
     @property
     def embed_model(self) -> str:
@@ -167,6 +182,56 @@ class HuggingFaceEmbeddingClient:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _resolve_device(self, torch: "Any") -> str:
+        """Resolve the configured device string to a concrete torch device.
+
+        Fixes CL-10's device-selection problems:
+        - ``auto`` now also considers Apple Silicon's Metal backend
+          (``mps``), which the old ``"cuda" if cuda else "cpu"`` logic
+          never selected on macOS.
+        - An explicit ``mps``/``cuda``/``cuda:N`` is honored (and validated
+          for availability) instead of silently falling through to CPU.
+        - A typo or unknown device (e.g. ``"gpu"``) raises a clear error
+          rather than silently running on CPU, which previously made a
+          misconfiguration look like a (very slow) success.
+        """
+        arg = (self._device_arg or "auto").strip().lower()
+
+        def _cuda_available() -> bool:
+            return bool(torch.cuda.is_available())
+
+        def _mps_available() -> bool:
+            backends = getattr(torch, "backends", None)
+            mps = getattr(backends, "mps", None) if backends is not None else None
+            return bool(mps is not None and mps.is_available())
+
+        if arg == "auto":
+            if _cuda_available():
+                return "cuda"
+            if _mps_available():
+                return "mps"
+            return "cpu"
+        if arg == "cpu":
+            return "cpu"
+        if arg == "mps":
+            if not _mps_available():
+                raise RuntimeError(
+                    "device='mps' requested but the MPS (Apple Metal) backend "
+                    "is not available. Use device='cpu' or device='auto'."
+                )
+            return "mps"
+        if arg == "cuda" or arg.startswith("cuda:"):
+            if not _cuda_available():
+                raise RuntimeError(
+                    f"device={self._device_arg!r} requested but CUDA is not "
+                    "available. Use device='cpu' or device='auto' instead."
+                )
+            return arg
+        raise RuntimeError(
+            f"Unknown device {self._device_arg!r}. Expected one of: "
+            "'auto', 'cpu', 'cuda', 'cuda:N', 'mps'."
+        )
+
     def _load_model(self) -> None:
         """Load AutoModel + AutoProcessor synchronously.
 
@@ -181,18 +246,7 @@ class HuggingFaceEmbeddingClient:
         import torch
         from transformers import AutoModel, AutoProcessor
 
-        # Resolve device
-        if self._device_arg == "auto":
-            self._device = "cuda" if torch.cuda.is_available() else "cpu"
-        elif self._device_arg == "cuda":
-            if not torch.cuda.is_available():
-                raise RuntimeError(
-                    "CUDA device requested but CUDA is not available. "
-                    "Use device='cpu' or device='auto' instead."
-                )
-            self._device = "cuda"
-        else:
-            self._device = "cpu"
+        self._device = self._resolve_device(torch)
 
         try:
             self._processor = AutoProcessor.from_pretrained(self._model_name)
@@ -261,8 +315,15 @@ class HuggingFaceEmbeddingClient:
                         "last_hidden_state)."
                     )
 
+        # L2-normalize so inner product == cosine similarity, matching the
+        # image-embedding server provider. Without this, switching between
+        # providers silently changed the magnitude of the vectors and
+        # therefore what a given cosine/similarity threshold actually meant
+        # downstream (CL-10).
+        normalized = torch.nn.functional.normalize(outputs, p=2, dim=1)
+
         # outputs shape: (batch, embedding_dim)
-        return [[float(x) for x in row] for row in outputs.detach().cpu()]
+        return [[float(x) for x in row] for row in normalized.detach().cpu()]
 
     def _encode_image(self, image_bytes: bytes) -> list[float]:
         """Run synchronous inference for a single image.
@@ -282,6 +343,28 @@ class HuggingFaceEmbeddingClient:
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         return self._run_forward([image])[0]
 
+    def _decode_for_batch(self, image_bytes: bytes) -> "PILImage.Image":
+        """Decode one image, downscaled for the embedding forward pass.
+
+        Uses ``Image.draft`` to have the JPEG decoder itself produce a
+        smaller image where possible (much cheaper than decoding at full
+        resolution and then downscaling), then a final ``thumbnail`` pass
+        to bound every format. CLIP-family processors resize to a small
+        fixed size anyway (commonly 224x224), so keeping the decoded image
+        at full camera resolution (e.g. 24 MP, ~50-200 KB compressed but
+        tens of MB once decoded to raw RGB) wastes memory for no benefit to
+        the embedding.
+        """
+        from PIL import Image
+
+        img = Image.open(io.BytesIO(image_bytes))
+        # draft() is a no-op for non-JPEG formats and only ever shrinks the
+        # image (never enlarges), so this is safe to call unconditionally.
+        img.draft("RGB", _DECODE_MAX_SIZE)
+        rgb_img = img.convert("RGB")
+        rgb_img.thumbnail(_DECODE_MAX_SIZE)
+        return rgb_img
+
     def _encode_batch(
         self,
         image_bytes_list: list[bytes],
@@ -293,7 +376,14 @@ class HuggingFaceEmbeddingClient:
         without re-sorting.
 
         Processes images in chunks of ``self._batch_size`` per forward
-        pass so VRAM usage stays bounded regardless of input size.
+        pass so VRAM usage stays bounded regardless of input size. Each
+        chunk's images are decoded just before that chunk's forward pass
+        (not all up front), so peak memory is bounded by roughly
+        ``batch_size`` decoded images rather than the whole input list. For
+        a library-wide analyze.embedding run, decoding every uncached
+        asset's original-resolution thumbnail up front (as this previously
+        did) could reach tens of gigabytes for a large batch of high-
+        resolution photos.
 
         Args:
             image_bytes_list: Raw image bytes for each asset.
@@ -303,29 +393,25 @@ class HuggingFaceEmbeddingClient:
             either the embedding vector (list of floats) or ``None`` when
             the image could not be decoded.
         """
-        from PIL import Image
-
-        # Decode all images, preserving original indices
-        decoded: list[tuple[int, Image.Image]] = []
         results: list[list[float] | None] = [None] * len(image_bytes_list)
 
-        for idx, image_bytes in enumerate(image_bytes_list):
-            try:
-                img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-                decoded.append((idx, img))
-            except Exception as exc:
-                logger.warning(
-                    "Failed to decode image at batch index %d: %s", idx, exc
-                )
+        for chunk_start in range(0, len(image_bytes_list), self._batch_size):
+            chunk_bytes = image_bytes_list[chunk_start : chunk_start + self._batch_size]
 
-        if not decoded:
-            return results
+            indices: list[int] = []
+            images: list["PILImage.Image"] = []
+            for offset, image_bytes in enumerate(chunk_bytes):
+                idx = chunk_start + offset
+                try:
+                    images.append(self._decode_for_batch(image_bytes))
+                    indices.append(idx)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to decode image at batch index %d: %s", idx, exc
+                    )
 
-        # Process in chunks of batch_size
-        for chunk_start in range(0, len(decoded), self._batch_size):
-            chunk = decoded[chunk_start : chunk_start + self._batch_size]
-            indices = [idx for idx, _ in chunk]
-            images = [img for _, img in chunk]
+            if not images:
+                continue
 
             try:
                 embeddings = self._run_forward(images)
@@ -338,6 +424,12 @@ class HuggingFaceEmbeddingClient:
                     chunk_start,
                     exc,
                 )
+            finally:
+                # Explicitly release decoded images before moving to the
+                # next chunk rather than waiting for the whole batch to
+                # finish and the list to go out of scope.
+                for img in images:
+                    img.close()
 
         return results
 
@@ -364,7 +456,11 @@ class HuggingFaceEmbeddingClient:
             raise RuntimeError(
                 "Model not loaded. Use 'async with' or call __aenter__ first."
             )
-        return await asyncio.to_thread(self._encode_image, image_bytes)
+        # Serialize forward passes on the shared model (CL-10).
+        async with self._inference_lock:
+            if self._model is None:
+                raise RuntimeError("Model was released while a request was pending.")
+            return await asyncio.to_thread(self._encode_image, image_bytes)
 
     async def embed_batch(
         self,
@@ -406,25 +502,35 @@ class HuggingFaceEmbeddingClient:
             )
         if not image_bytes_list:
             return []
-        return await asyncio.to_thread(self._encode_batch, image_bytes_list)
+        # Serialize forward passes on the shared model (CL-10).
+        async with self._inference_lock:
+            if self._model is None:
+                raise RuntimeError("Model was released while a request was pending.")
+            return await asyncio.to_thread(self._encode_batch, image_bytes_list)
 
     async def close(self) -> None:
         """Release the model, processor, and GPU memory.
 
         After calling close the client cannot be used for embedding
         until ``__aenter__`` is called again.
+
+        Acquires the inference lock first so the model isn't nulled out
+        from under an in-flight forward pass (CL-10) — previously close()
+        could set ``self._model = None`` while another coroutine's
+        ``to_thread`` inference was still running against it.
         """
-        self._model = None
-        self._processor = None
+        async with self._inference_lock:
+            self._model = None
+            self._processor = None
 
-        if self._device == "cuda":
-            try:
-                import torch
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
+            if self._device == "cuda":
+                try:
+                    import torch
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
 
-        self._device = None
+            self._device = None
         logger.info("Released HuggingFace model '%s'", self._model_name)
 
     @property

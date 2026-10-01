@@ -32,8 +32,14 @@ class FilterSmartSearch(Stage):
             raise RuntimeError("image_client is required for stage 'filter.smart_search'")
         fetched = await image_client.search_smart(query, max_candidates)
 
-        in_context = {a.id for a in pre_filter}
-        candidates = [a for a in fetched if a.id in in_context]
+        # Keep the context's own Asset objects (with score/phash/embedding/
+        # etc. attached by earlier stages), not the fresh objects the
+        # search API returns. Using `fetched` directly would silently drop
+        # every bit of upstream metadata for a matched asset — see the code
+        # review (ND-03) for the downstream consequences (min_score, select
+        # stages all seeing score=0).
+        by_id = {a.id: a for a in pre_filter}
+        candidates = [by_id[a.id] for a in fetched if a.id in by_id]
 
         ctx.assets = handle_empty_pool(self, ctx, candidates, pre_filter, photo_count)
         ctx.stats["filter.smart_search.kept"] = len(ctx.assets)

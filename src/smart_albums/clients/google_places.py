@@ -60,10 +60,8 @@ def _haversine_meters(lat1: float, lon1: float, lat2: float, lon2: float) -> flo
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
-# Pattern to parse plus_code compound_code: "CODE+CODE City, STATE, COUNTRY"
-_COMPOUND_CODE_PATTERN = re.compile(
-    r"[23456789CFGHJMPQRVWX+]+\s+(.+?),\s*([A-Z]{2,}),\s*([A-Z]{2,})"
-)
+# Plus-code prefix at the start of a compound_code, e.g. "849VCWC8+R9".
+_PLUS_CODE_PREFIX = re.compile(r"^[23456789CFGHJMPQRVWX]+\+[23456789CFGHJMPQRVWX]+\s+")
 
 
 @ProtocolsRegistry.register("google_places", IGeoClient)
@@ -80,11 +78,16 @@ class GooglePlacesGeoClient:
         api_key: str,
         default_radius: int = 1000,
         max_results: int = 10,
+        timeout: float = 10.0,
     ) -> None:
         _check_dependencies()
         import googlemaps
 
-        self._client = googlemaps.Client(key=api_key)
+        # Without a timeout the googlemaps client could hang indefinitely
+        # while occupying a slot in the shared asyncio.to_thread pool
+        # (CL-13). googlemaps.Client accepts a per-request timeout.
+        self._timeout = float(timeout)
+        self._client = googlemaps.Client(key=api_key, timeout=self._timeout)
         self._api_key = api_key
         self._default_radius = default_radius
         self._max_results = max_results
@@ -95,15 +98,22 @@ class GooglePlacesGeoClient:
         return "https://maps.googleapis.com/maps/api/place/nearbysearch"
 
     async def health_check(self) -> bool:
-        """Check connectivity by performing a minimal places_nearby request."""
+        """Check connectivity/credentials without a billable Places call.
+
+        The old health check fired a Nearby Search at (0,0), which is a
+        *billable* Places API request charged on every health poll (CL-13).
+        This instead issues a Geocoding request for a fixed well-known
+        place — Geocoding is a different, far cheaper product and the call
+        still exercises auth + connectivity. If the SDK/endpoint isn't
+        available it falls back to simply confirming the client is
+        configured, rather than spending money to answer "are we up?".
+        """
         try:
-            # Use a known location (0,0) with tiny radius — should return quickly
-            await asyncio.to_thread(
-                self._client.places_nearby,
-                location=(0.0, 0.0),
-                radius=1,
-            )
-            return True
+            geocode = getattr(self._client, "geocode", None)
+            if geocode is None:
+                return self._client is not None
+            result = await asyncio.to_thread(geocode, "Googleplex, Mountain View, CA")
+            return bool(result)
         except Exception:
             return False
 
@@ -113,6 +123,7 @@ class GooglePlacesGeoClient:
         longitude: float,
         radius_meters: int | None = None,
         max_results: int | None = None,
+        place_type: str | None = None,
     ) -> list[PlaceCandidate]:
         """Resolve GPS coordinates into ranked nearby place candidates.
 
@@ -121,6 +132,13 @@ class GooglePlacesGeoClient:
             longitude: Longitude in degrees.
             radius_meters: Search radius (default from constructor).
             max_results: Maximum candidates to return (default from constructor).
+            place_type: Optional Google Places type filter (e.g.
+                "point_of_interest"), passed through to the Nearby Search
+                API's ``type`` parameter. ``place_type`` is not part of the
+                base ``IGeoClient`` protocol signature (an optional keyword
+                argument with a default is compatible with structural
+                typing, but callers that only know about ``IGeoClient``
+                should treat it as an extension specific to this client).
 
         Returns:
             List of PlaceCandidate sorted by distance from the query point.
@@ -129,7 +147,7 @@ class GooglePlacesGeoClient:
         limit = max_results if max_results is not None else self._max_results
 
         raw_results = await asyncio.to_thread(
-            self._fetch_nearby, latitude, longitude, radius, limit
+            self._fetch_nearby, latitude, longitude, radius, place_type
         )
 
         candidates: list[PlaceCandidate] = []
@@ -159,28 +177,73 @@ class GooglePlacesGeoClient:
         candidates.sort(key=lambda c: c.distance_meters)
         return candidates[:limit]
 
+    # Hard cap on pages to follow so a pathological query can't paginate
+    # forever (the Places API returns up to 20 results/page, 3 pages max).
+    _MAX_PAGES = 3
+
     def _fetch_nearby(
-        self, lat: float, lng: float, radius: int, max_results: int
+        self, lat: float, lng: float, radius: int, place_type: str | None = None
     ) -> list[dict[str, Any]]:
         """Synchronous Places API call with pagination.
 
-        Mirrors the calendar_maker geoutil._get_nearby_places pattern.
+        Returns *all* fetched results (up to the page cap) without
+        truncating — the caller (``reverse_geocode``) sorts by distance and
+        then truncates to ``max_results``. The previous code sliced
+        ``results[:max_results]`` here, *before* that sort, so it kept the N
+        most prominent places Google returned rather than the N nearest
+        (CL-13).
         """
+        kwargs: dict[str, Any] = {"location": (lat, lng), "radius": radius, "open_now": False}
+        if place_type:
+            kwargs["type"] = place_type
+
         results: list[dict[str, Any]] = []
-        response: dict[str, Any] = self._client.places_nearby(
-            location=(lat, lng), radius=radius, open_now=False
-        )
+        response: dict[str, Any] = self._client.places_nearby(**kwargs)
         results.extend(response.get("results", []))
 
-        # Follow next_page_token pagination
-        while "next_page_token" in response and len(results) < max_results:
-            time.sleep(2)  # Token needs a short delay to become valid
-            response = self._client.places_nearby(
-                page_token=response["next_page_token"]
-            )
+        # Follow next_page_token pagination. A freshly-issued page token is
+        # not valid immediately; the API returns INVALID_REQUEST until it
+        # activates (usually a second or two). The old fixed 2s sleep could
+        # still race and, on INVALID_REQUEST, the whole call raised and the
+        # already-fetched first page was discarded (CL-13). Retry the token
+        # a few times with backoff and, if it never activates, return what
+        # we already have instead of throwing it away.
+        pages = 1
+        while "next_page_token" in response and pages < self._MAX_PAGES:
+            token = response["next_page_token"]
+            next_response = self._fetch_page_with_token(token)
+            if next_response is None:
+                break
+            response = next_response
             results.extend(response.get("results", []))
+            pages += 1
 
-        return results[:max_results]
+        return results
+
+    def _fetch_page_with_token(self, token: str) -> dict[str, Any] | None:
+        """Fetch one more page by token, tolerating token-not-yet-valid.
+
+        Returns the response dict, or ``None`` if the token never became
+        valid (so the caller keeps the pages fetched so far rather than
+        failing the whole request).
+        """
+        import googlemaps
+
+        delay = 2.0
+        for _attempt in range(3):
+            time.sleep(delay)
+            try:
+                return dict(self._client.places_nearby(page_token=token))
+            except googlemaps.exceptions.ApiError as exc:
+                # INVALID_REQUEST while the token is still warming up — back
+                # off and retry. Any other API error is real; stop paging.
+                if getattr(exc, "status", None) == "INVALID_REQUEST":
+                    delay *= 1.5
+                    continue
+                logger.warning("Places pagination failed: %s", exc)
+                return None
+        logger.warning("Places next_page_token did not activate; returning partial results")
+        return None
 
     def _parse_location(self, place: dict[str, Any]) -> tuple[str, str, str]:
         """Extract city/state/country from plus_code compound_code or vicinity.
@@ -192,13 +255,23 @@ class GooglePlacesGeoClient:
         compound = plus_code.get("compound_code", "")
 
         if compound:
-            match = _COMPOUND_CODE_PATTERN.match(compound)
-            if match:
-                return (
-                    match.group(1).strip(),
-                    match.group(2).strip(),
-                    match.group(3).strip(),
-                )
+            # Strip the leading plus-code token, then split the remaining
+            # "City, Region, Country"-ish string on commas. The old regex
+            # required exactly three comma-separated ALL-CAPS-abbreviated
+            # fields ("City, ST, US"), so any locality that doesn't follow
+            # the US state-abbreviation convention — most of the world,
+            # e.g. "Shibuya City, Tokyo, Japan" or "Paris, France" (two
+            # parts) — matched nothing and fell through (CL-13). Splitting
+            # positionally handles 2+ parts regardless of casing/length.
+            remainder = _PLUS_CODE_PREFIX.sub("", compound).strip()
+            parts = [p.strip() for p in remainder.split(",") if p.strip()]
+            if len(parts) >= 3:
+                # city, (one or more middle region parts collapsed), country
+                return parts[0], ", ".join(parts[1:-1]), parts[-1]
+            if len(parts) == 2:
+                return parts[0], "", parts[1]
+            if len(parts) == 1:
+                return parts[0], "", ""
 
         # Fallback: parse vicinity string
         vicinity = place.get("vicinity", "")

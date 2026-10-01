@@ -27,6 +27,20 @@ from smart_albums.core.registry import stage
 logger = logging.getLogger(__name__)
 
 
+def _phash_cache_key(asset: Any) -> str:
+    """Build a cache key that changes when the underlying image changes.
+
+    A pHash depends on the image bytes, not just the asset id. Including
+    ``file_size`` and ``captured_at`` (both of which change when a photo is
+    re-uploaded or edited in place while keeping the same id) means an
+    edited image no longer gets served its pre-edit hash from cache
+    (ND-14).
+    """
+    file_size = str(asset.file_size) if asset.file_size is not None else ""
+    captured = asset.captured_at.isoformat() if asset.captured_at is not None else ""
+    return ":".join((asset.id, file_size, captured))
+
+
 def _compute_phash(image_bytes: bytes) -> str:
     """Compute a 64-bit perceptual hash (hex string) from image bytes.
 
@@ -103,8 +117,16 @@ class AnalyzePHash(Stage):
                 return
 
             async with semaphore:
-                # Check cache
-                cache_key = asset.id
+                # Check cache. Key on (id, file_size, captured_at) rather
+                # than id alone: a pHash is a function of the image bytes,
+                # and when a photo is edited in place its id stays the same
+                # while its bytes (and typically file_size / captured_at)
+                # change. Keying on id alone meant an edited image kept the
+                # stale hash of its pre-edit version forever (ND-14), so
+                # dedup/partition decisions were made against the wrong
+                # image. Including the fields that change on an edit evicts
+                # the stale entry automatically.
+                cache_key = _phash_cache_key(asset)
                 if cache is not None:
                     hit = cache.get(cache_key)
                     if hit is not None:

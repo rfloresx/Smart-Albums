@@ -82,7 +82,7 @@ class TestSelectDiversePickStage:
         )
         node = SelectDiversePick({})
         result = await node.run(ctx)
-        assert result[0].stats["picks_selected"] == 0
+        assert result[0].stats["select.diverse_pick.picks_selected"] == 0
 
     @pytest.mark.asyncio
     async def test_single_asset(self):

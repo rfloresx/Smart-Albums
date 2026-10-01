@@ -18,6 +18,30 @@ class PublishCreateAlbum(Stage):
         ConfigParam("dry_run", bool, default=False),
     )
 
+    async def func(self, contexts: ContextBatch) -> ContextBatch:
+        """Run once against the union of all contexts' assets.
+
+        The base ``Stage.func`` calls ``run()`` once per context. For a
+        publish stage that meant, with multiple contexts (unmerged
+        partitions, fork branches), only the first context to run actually
+        created the album — every later context hit the "already exists"
+        conflict path and its assets were silently dropped from the album.
+        Combining contexts first ensures every selected asset makes it into
+        the one album this stage creates.
+        """
+        if not contexts:
+            return contexts
+        if len(contexts) == 1:
+            return await self.run(contexts[0])
+
+        merged = PipelineContext(
+            config=contexts[0].config,
+            assets=[a for ctx in contexts for a in ctx.assets],
+            stats={},
+            metadata=contexts[0].metadata,
+        )
+        return await self.run(merged)
+
     async def run(self, ctx: PipelineContext) -> ContextBatch:
         name = self.get("name")
         dry_run = self.get("dry_run")
@@ -44,6 +68,15 @@ class PublishCreateAlbum(Stage):
                 return [ctx]
 
         result = await image_client.create_album(name, asset_ids)
+
+        # Record publish history so select.avoid_repeat's cooldown has
+        # something to read on later runs (ND-11). Done after the album is
+        # successfully created, and skipped entirely on dry runs (handled
+        # above). A missing cache manager makes this a no-op.
+        from datetime import date
+        from smart_albums.utils.history import record_shown
+        record_shown(asset_ids, date.today())
+
         ctx.stats["publish.create_album.created"] = True
         ctx.stats["publish.create_album.name"] = name
         ctx.stats["publish.create_album.url"] = result.url

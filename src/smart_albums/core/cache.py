@@ -13,18 +13,59 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
+import uuid
 from pathlib import Path
 from threading import RLock
-from typing import Any, Optional
+from typing import Any
 
 from protocols_system import ProtocolsRegistry
-from protocols_system.protocols import ICache, ICacheManager
+from protocols_system.protocols import ICacheManager
 
 logger = logging.getLogger(__name__)
 
+# Characters allowed in a cache name used as a filename stem. Anything else
+# is replaced, so a cache_name containing path separators or ".." cannot
+# escape the cache directory (CO-08 path traversal).
+_SAFE_CACHE_NAME = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _default_cache_dir() -> str:
+    """Compute a sensible default cache directory that doesn't depend on
+    the current working directory.
+
+    The old default (a bare relative ``".cache"`` string) resolved against
+    whatever the process's CWD happened to be. In the CLI Docker image that
+    is "/" (no ``WORKDIR`` is set for the runtime stage), so the default
+    "cache" provider tried to create "/.cache" as a non-root user and
+    failed with PermissionError, breaking every pipeline run that didn't
+    explicitly configure ``cachemanager.cache.cache_dir``. Outside Docker,
+    a CWD-relative cache is a "which cache am I actually using" hazard —
+    running the same command from a different directory silently uses a
+    different (or no) cache.
+
+    Resolution order:
+    1. ``APPDATA_DIR`` env var (set by the CLI Docker image to ``/config``)
+       — ``<APPDATA_DIR>/cache``.
+    2. ``~/.cache/smart-albums`` (XDG-ish default for local/dev use).
+    """
+    appdata_dir = os.environ.get("APPDATA_DIR")
+    if appdata_dir:
+        return str(Path(appdata_dir) / "cache")
+    return str(Path.home() / ".cache" / "smart-albums")
+
 def _normalize_key(key: str | tuple[str, ...]) -> str:
+    """Normalize a cache key to a stable, collision-free string.
+
+    A tuple key is encoded with ``json.dumps`` rather than ``":".join(...)``
+    (CO-08): joining on ``":"`` made ``("a:b", "c")`` and ``("a", "b:c")``
+    collide, which is a real hazard because model names like ``llava:latest``
+    (used in embedding/score cache keys) contain colons. JSON encoding of
+    the list is unambiguous.
+    """
     if isinstance(key, tuple):
-        key = ":".join([str(k) for k in key])
+        return json.dumps(list(key), ensure_ascii=False)
     return key
 
 class Cache:
@@ -60,8 +101,15 @@ class Cache:
         skipped = 0
         total_lines = 0
 
+        corrupted = False
         with self._file_path.open("r", encoding="utf-8") as fh:
             for line_number, raw_line in enumerate(fh, start=1):
+                # A crash mid-write can leave a final line without its
+                # trailing newline, so the next append is glued onto it and
+                # produces one unparseable line (CO-08). Such a line is
+                # skipped here (and compaction below rewrites the file
+                # cleanly, dropping it). ``strip`` also tolerates a torn
+                # line that happens to still be valid JSON.
                 line = raw_line.strip()
                 if not line:
                     continue
@@ -79,14 +127,18 @@ class Cache:
                         exc,
                     )
                     skipped += 1
+                    corrupted = True
 
         logger.debug(
             "Cache loaded from %s: %d entries loaded, %d skipped",
             self._file_path, loaded, skipped,
         )
 
-        # Compact if file has more valid lines than unique keys (duplicates exist)
-        if total_lines - skipped > len(self._data):
+        # Compact if the file has more valid lines than unique keys
+        # (duplicates exist), or if any line was corrupted — the latter
+        # ensures a torn/garbled line is physically removed on next load
+        # rather than lingering forever (CO-08).
+        if corrupted or (total_lines - skipped > len(self._data)):
             self._compact()
 
     def _compact(self) -> None:
@@ -101,12 +153,27 @@ class Cache:
             self._file_path.stem,
             unique_count,
         )
-        tmp_path = self._file_path.with_suffix(".jsonl.tmp")
-        with tmp_path.open("w", encoding="utf-8") as f:
-            for key, value in self._data.items():
-                record = {"key": key, "value": value}
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
-        tmp_path.replace(self._file_path)
+        # Use a process-unique temp name (CO-08): the web GUI can run several
+        # CLI processes against the same cache dir, and a shared
+        # ``.jsonl.tmp`` name meant two concurrent compactions clobbered
+        # each other's temp file. fsync before the atomic replace so the
+        # rewritten contents are durable even if the machine loses power
+        # right after.
+        tmp_path = self._file_path.with_name(
+            f"{self._file_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            with tmp_path.open("w", encoding="utf-8") as f:
+                for key, value in self._data.items():
+                    record = {"key": key, "value": value}
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            tmp_path.replace(self._file_path)
+        finally:
+            # If replace() succeeded the temp file is gone; this cleans up
+            # a temp left behind by a mid-compaction failure.
+            tmp_path.unlink(missing_ok=True)
         logger.debug("Cache compaction complete: %s", self._file_path)
 
     def get(self, key: str | tuple[str, ...], default: Any = None) -> Any:
@@ -121,32 +188,41 @@ class Cache:
         """Store a value in cache and append to JSONL."""
         key_str = _normalize_key(key)
 
+        # Serialize *before* mutating in-memory state (CO-08). The old order
+        # updated ``self._data`` first, so a value that can't be JSON-encoded
+        # (e.g. a numpy float32/ndarray) raised after the memory dict already
+        # held it — leaving memory and the on-disk file permanently out of
+        # sync. Encoding first means a bad value fails cleanly with nothing
+        # changed.
+        record = {"key": key_str, "value": value}
+        line = json.dumps(record, ensure_ascii=False) + "\n"
+
         with self._lock:
             is_update = key_str in self._data
-            self._data[key_str] = value
-
-            record = {
-                "key": key_str,
-                "value": value,
-            }
 
             logger.debug(
                 "Cache %s PUT key=%r (%s), total entries=%d",
                 self._file_path.stem, key_str,
                 "update" if is_update else "new",
-                len(self._data),
+                len(self._data) + (0 if is_update else 1),
             )
 
             with self._file_path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                f.write(line)
+                f.flush()
+                os.fsync(f.fileno())
+
+            self._data[key_str] = value
 
     def __contains__(self, key: object) -> bool:
         if isinstance(key, (str, tuple)):
-            return _normalize_key(key) in self._data
+            with self._lock:
+                return _normalize_key(key) in self._data
         return False
 
     def __len__(self) -> int:
-        return len(self._data)
+        with self._lock:
+            return len(self._data)
 
 @ProtocolsRegistry.register("cache", ICacheManager)
 class CacheManager(ICacheManager):
@@ -163,8 +239,8 @@ class CacheManager(ICacheManager):
         products.put("p1", {"price": 10})
     """
 
-    def __init__(self, cache_dir: str = ".cache") -> None:
-        self._cache_dir = Path(cache_dir).expanduser().absolute()
+    def __init__(self, cache_dir: str | None = None) -> None:
+        self._cache_dir = Path(cache_dir or _default_cache_dir()).expanduser().absolute()
         self._cache_dir.mkdir(parents=True, exist_ok=True)
 
         self._caches: dict[str, Cache] = {}
@@ -174,7 +250,12 @@ class CacheManager(ICacheManager):
     def get_cache(self, cache_name: str) -> Cache:
         with self._lock:
             if cache_name not in self._caches:
-                file_path = self._cache_dir / f"{cache_name}.jsonl"
+                # Sanitize the name before using it as a filename stem so a
+                # cache_name containing "/" or ".." can't write outside the
+                # cache directory (CO-08). The cache is still keyed by the
+                # original name in-memory so distinct names stay distinct.
+                safe_stem = _SAFE_CACHE_NAME.sub("_", cache_name).strip("._") or "cache"
+                file_path = self._cache_dir / f"{safe_stem}.jsonl"
                 logger.debug("Creating new cache %r at %s", cache_name, file_path)
                 self._caches[cache_name] = Cache(file_path)
             else:

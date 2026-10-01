@@ -22,7 +22,9 @@ The easiest way to run smart-albums is with the web interface:
 docker compose -f docker-compose.webgui.yml up -d
 ```
 
-Then open `http://localhost:8080` in your browser. On first launch you'll create an admin account and configure your providers (Immich, Ollama/llama.cpp, embeddings) through the settings page.
+Then open `http://localhost:8080` in your browser and configure your providers (Immich, Ollama/llama.cpp, embeddings) through the settings page.
+
+Because the container listens on all interfaces by default, the server refuses to start with an open, unauthenticated `/setup` page. Set `ADMIN_USERNAME`/`ADMIN_PASSWORD` before the first start to have the admin account created automatically, or set `ALLOW_OPEN_SETUP=1` if you accept that the first visitor to `/setup` becomes the admin (only recommended on a trusted network, for the first run).
 
 ### Docker (CLI only)
 
@@ -79,6 +81,7 @@ Opens at `http://localhost:8000` by default (port `8000` inside the container, m
 | `STORAGE_SECRET` | (random) | NiceGUI session encryption key. Set for persistent sessions across restarts |
 | `ADMIN_USERNAME` | — | Auto-create admin account on first startup |
 | `ADMIN_PASSWORD` | — | Password for auto-created admin |
+| `ALLOW_OPEN_SETUP` | — | Set to `1` or `true` to allow starting with no admin account while bound to `0.0.0.0` (the first `/setup` visitor becomes admin). Without this, startup fails fast unless `ADMIN_USERNAME`/`ADMIN_PASSWORD` are set or the server is bound to `127.0.0.1` |
 | `HOST` | `0.0.0.0` | Bind address |
 | `PORT` | `8000` | Bind port |
 | `DEV` | — | Set to `1` or `true` to enable hot-reload |
@@ -244,7 +247,7 @@ Pipeline settings within fork branches are prefixed with `output.branches.<branc
 - Python 3.11+
 - A running [Immich](https://immich.app/) server with an API key
 - A vision LLM backend: [Ollama](https://ollama.com/), llama.cpp, or OpenAI-compatible
-- An embedding backend: HuggingFace (local GPU), Ollama, or a remote embedding service
+- An embedding backend: HuggingFace (local GPU) or a remote embedding service (`image_embedding`). Ollama's embedding models are text-only, so Ollama is not a valid embedding backend for images — the `ollama`/`ollama_v2` embedding providers raise `NotImplementedError` if selected.
 
 ## Immich API Permissions
 

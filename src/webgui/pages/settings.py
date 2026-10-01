@@ -20,6 +20,7 @@ from typing import Any
 import httpx
 from nicegui import ui
 
+from webgui.auth import get_current_username
 from webgui.components.navbar import build_navbar
 from webgui.config import AuthConfig, ProviderConfig
 from webgui.services import providers as providers_service
@@ -31,6 +32,18 @@ logger = logging.getLogger(__name__)
 def _prettify(name: str) -> str:
     """Turn a snake_case parameter name into a Title Case label."""
     return name.replace("_", " ").strip().title()
+
+
+# Sentinel placeholder shown for a previously-saved secret instead of its
+# real value. "Collect" treats a field left at exactly this placeholder as
+# "keep the existing stored value", so a save that doesn't touch the secret
+# field doesn't need to resend it, and the browser never receives the
+# actual key over the websocket or sees it sitting in the page's DOM
+# (WG-11). A real secret value is extremely unlikely to collide with this
+# literal string, but to be certain, the field will not revert to the
+# placeholder even if a user types it manually — only the untouched
+# server-rendered default is special-cased in `_coerce`.
+_SECRET_PLACEHOLDER = "••••••••(unchanged)"
 
 
 def _make_field(param: providers_service.ParamSpec, value: Any) -> Any:
@@ -54,12 +67,20 @@ def _make_field(param: providers_service.ParamSpec, value: Any) -> Any:
         return ui.number(label=label, value=numeric).classes("w-full")
 
     if param.kind == "password":
-        return ui.input(
+        # Never pre-fill the real secret value into the DOM. If a value is
+        # already saved, show a placeholder instead; `_coerce` maps the
+        # placeholder back to "keep the stored value" at save time. An
+        # empty field (no saved value yet) stays empty as before.
+        has_saved_value = bool(value)
+        element = ui.input(
             label=label,
-            value=str(value) if value not in (None, "") else "",
+            value=_SECRET_PLACEHOLDER if has_saved_value else "",
             password=True,
             password_toggle_button=True,
         ).classes("w-full")
+        if has_saved_value:
+            element.props("hint='Leave as-is to keep the saved value, or type a new one.'")
+        return element
 
     # Plain string.
     return ui.input(
@@ -68,8 +89,17 @@ def _make_field(param: providers_service.ParamSpec, value: Any) -> Any:
     ).classes("w-full")
 
 
-def _coerce(param: providers_service.ParamSpec, value: Any) -> Any:
-    """Coerce a widget value back to the parameter's expected type."""
+def _coerce(param: providers_service.ParamSpec, value: Any, saved_value: Any = None) -> Any:
+    """Coerce a widget value back to the parameter's expected type.
+
+    For a ``password`` field left at the placeholder (see
+    ``_SECRET_PLACEHOLDER``), returns the original saved value instead of
+    the placeholder text itself — the user never edited the secret, so the
+    stored value should be preserved as-is rather than being overwritten
+    with the literal placeholder string.
+    """
+    if param.kind == "password" and value == _SECRET_PLACEHOLDER:
+        return saved_value if saved_value is not None else ""
     if param.kind == "bool":
         return bool(value)
     if param.kind == "int":
@@ -98,7 +128,7 @@ class _ProviderSection:
         self.specs = providers_service.get_providers_for(slot)
         self.spec_by_name = {s.name: s for s in self.specs}
         self.current = state.config.get_provider(slot.name)
-        self.fields: dict[str, tuple[providers_service.ParamSpec, Any]] = {}
+        self.fields: dict[str, tuple[providers_service.ParamSpec, Any, Any]] = {}
 
         names = [s.name for s in self.specs]
         default_sel = (
@@ -174,7 +204,11 @@ class _ProviderSection:
             for param in spec.params:
                 value = saved.get(param.name, param.default)
                 element = _make_field(param, value)
-                self.fields[param.name] = (param, element)
+                # Keep the real saved value server-side (not sent to the
+                # browser for password fields — see _make_field) so
+                # `collect()` can restore it if the user leaves the
+                # placeholder untouched.
+                self.fields[param.name] = (param, element, value)
 
     def collect(self) -> tuple[str, dict[str, Any]]:
         """Return the selected provider name and coerced parameter dict."""
@@ -182,8 +216,8 @@ class _ProviderSection:
             return "", {}
         selected = self.select.value or ""
         params = {
-            name: _coerce(param, element.value)
-            for name, (param, element) in self.fields.items()
+            name: _coerce(param, element.value, saved_value)
+            for name, (param, element, saved_value) in self.fields.items()
         }
         return selected, params
 
@@ -307,15 +341,20 @@ async def settings_page() -> None:
         with ui.card().classes("w-full"):
             ui.label("🔒 Auth Settings").classes("text-h6")
 
+            was_auth_enabled = state.config.auth.enabled
             auth_enabled_switch = ui.switch(
                 "Authentication enabled",
-                value=state.config.auth.enabled,
+                value=was_auth_enabled,
             )
+            ui.label(
+                "Disabling this makes every page and API endpoint public, "
+                "including this settings page and backup/restore in Tools."
+            ).classes("text-caption text-warning")
 
         ui.separator().classes("q-my-md")
 
         # --- Save All ---
-        async def save_all() -> None:
+        async def _do_save() -> None:
             # Save provider config
             updated: dict[str, ProviderConfig] = {}
             for section in sections:
@@ -337,8 +376,57 @@ async def settings_page() -> None:
             await state.db.set_setting(AUTH_SETTINGS_KEY, auth_data)
             state.config.auth = AuthConfig(**auth_data)
 
+            if was_auth_enabled and not auth_enabled_switch.value:
+                logger.warning(
+                    "Authentication disabled via settings page by user %r — "
+                    "the UI and all /api endpoints are now public.",
+                    get_current_username(),
+                )
+
             logger.info("Settings saved (providers + auth)")
             ui.notify("Settings saved", type="positive")
 
+        async def save_all() -> None:
+            # Guard against double-submit — otherwise two concurrent clicks
+            # could both pass the "was auth enabled" check before either
+            # write lands, or fire two overlapping provider saves (WG-23).
+            if save_btn.props.get("disable"):
+                return
+            save_btn.props("disable loading")
+            try:
+                # Disabling auth makes the whole app public, including this
+                # settings page and the Tools page's backup/restore and
+                # migration-script runner — require an explicit confirmation
+                # rather than letting it happen as a side effect of one click
+                # on "Save all" (WG-13).
+                if was_auth_enabled and not auth_enabled_switch.value:
+                    with ui.dialog() as dlg, ui.card():
+                        ui.label("Disable authentication?").classes("text-subtitle1")
+                        ui.label(
+                            "This makes the entire web UI and all API endpoints "
+                            "(including database backup/restore) accessible to "
+                            "anyone who can reach this server, with no login "
+                            "required. This takes effect immediately for every "
+                            "visitor."
+                        ).classes("text-body2 text-grey")
+                        with ui.row().classes("justify-end w-full gap-2"):
+                            ui.button("Cancel", on_click=dlg.close).props("flat")
+
+                            async def _confirm() -> None:
+                                dlg.close()
+                                await _do_save()
+
+                            ui.button(
+                                "Disable authentication and save",
+                                color="negative",
+                                on_click=_confirm,
+                            )
+                    dlg.open()
+                    return
+
+                await _do_save()
+            finally:
+                save_btn.props(remove="disable loading")
+
         with ui.row().classes("w-full justify-end q-mt-md"):
-            ui.button("Save all", on_click=save_all).props("color=primary")
+            save_btn = ui.button("Save all", on_click=save_all).props("color=primary")

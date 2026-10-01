@@ -17,7 +17,7 @@ from smart_albums.core.node import Stage, ConfigParam
 from smart_albums.utils.phash_utils import hamming_distance as _hamming_distance
 from smart_albums.core.registry import stage
 from smart_albums.utils.split import split_contexts
-from smart_albums.utils.union_find import UnionFind
+from smart_albums.utils.union_find import AnchoredUnionFind
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +30,13 @@ def _union_find_phash(
     Compares all pairs (O(N^2)) — acceptable for the expected small group sizes
     within a partition context.
 
+    Uses an anchor-bounded union-find (ND-10): plain single-linkage
+    union-find lets A~B and B~C merge A and C into one group however far
+    apart A and C actually are, so a long chain of gradually-drifting
+    near-duplicates collapses into one giant group. Requiring a candidate
+    to also match each group's fixed anchor bounds how far a group can
+    drift from its first member.
+
     Args:
         assets: Assets with valid phash metadata.
         threshold: Similarity threshold in [0.0, 1.0]. Two assets are
@@ -41,14 +48,17 @@ def _union_find_phash(
     """
     max_distance = int((1.0 - threshold) * 64)
     n = len(assets)
-    uf = UnionFind(n)
+    hashes = [a.metadata["phash"] for a in assets]
+
+    def _similar(i: int, j: int) -> bool:
+        return _hamming_distance(hashes[i], hashes[j]) <= max_distance
+
+    uf = AnchoredUnionFind(n)
 
     for i in range(n):
         for j in range(i + 1, n):
-            h1 = assets[i].metadata["phash"]
-            h2 = assets[j].metadata["phash"]
-            if _hamming_distance(h1, h2) <= max_distance:
-                uf.union(i, j)
+            if _similar(i, j):
+                uf.try_union(i, j, _similar)
 
     groups: dict[int, list[Asset]] = defaultdict(list)
     for i in range(n):
@@ -94,14 +104,23 @@ class PartitionPHash(Stage):
         with_phash = [a for a in ctx.assets if a.metadata.get("phash")]
         without_phash = [a for a in ctx.assets if not a.metadata.get("phash")]
 
-        if len(with_phash) < 2:
-            return [ctx]
-
-        # Union-Find grouping
-        groups = _union_find_phash(with_phash, threshold)
+        # Only run Union-Find grouping when there are at least 2 hashed
+        # assets to compare. With fewer than 2, there is no basis to group
+        # anything — treat each hashed asset as its own singleton partition
+        # instead of falling back to returning the whole (unsplit) context.
+        # Returning the unsplit context here used to mean that if, say,
+        # thumbnail fetches mostly failed and only 0-1 assets got a phash,
+        # every asset in the pool — including ones we have no evidence are
+        # duplicates — would flow into the next stage (typically
+        # select.best) as a single "duplicate group" and get reduced down
+        # to one asset, silently discarding the rest of the pool.
+        if len(with_phash) >= 2:
+            groups = _union_find_phash(with_phash, threshold)
+            partitions: list[list[Asset]] = list(groups.values())
+        else:
+            partitions = [[a] for a in with_phash]
 
         # Each group + individual contexts for assets without phash
-        partitions: list[list[Asset]] = list(groups.values())
         for asset in without_phash:
             partitions.append([asset])
 

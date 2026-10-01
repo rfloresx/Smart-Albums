@@ -15,10 +15,9 @@ from __future__ import annotations
 
 import io
 import logging
-from typing import Optional
 
 import numpy as np
-from PIL import Image, ImageFilter
+from PIL import Image
 
 from smart_albums.core.context import PipelineContext, ContextBatch
 from protocols_system.protocols import Asset
@@ -41,8 +40,18 @@ _ANALYSIS_WEIGHT = 1.0 - _SHARPNESS_WEIGHT
 def _compute_sharpness(image_bytes: bytes) -> float:
     """Compute normalized sharpness via Laplacian variance.
 
-    Opens the image, converts to grayscale, applies a Laplacian filter,
-    and computes the variance of the response. Normalized to [0, 1].
+    Opens the image, converts to grayscale, convolves with a Laplacian
+    kernel in floating point, and computes the variance of the response.
+    Normalized to [0, 1].
+
+    The convolution is done directly on a float64 grayscale array rather
+    than via ``PIL.ImageFilter.Kernel`` (ND-19). PIL's kernel path runs in
+    8-bit integer space with a +128 offset and clamps every intermediate
+    pixel to [0, 255]; for a sharp image the Laplacian response routinely
+    exceeds that range and saturates, which *caps* the variance and makes
+    genuinely sharp and merely-ok images look similar. Computing in float
+    keeps the full dynamic range so the variance actually reflects
+    sharpness.
 
     Args:
         image_bytes: Raw image bytes.
@@ -52,19 +61,46 @@ def _compute_sharpness(image_bytes: bytes) -> float:
     """
     try:
         img = Image.open(io.BytesIO(image_bytes)).convert("L")
-        laplacian = img.filter(
-            ImageFilter.Kernel(
-                (3, 3),
-                [0, 1, 0, 1, -4, 1, 0, 1, 0],
-                scale=1,
-                offset=128,
-            )
+        arr = np.asarray(img, dtype=np.float64)
+        if arr.ndim != 2 or arr.size == 0:
+            return 0.0
+        # 4-neighbor Laplacian via array shifts (interior pixels only).
+        lap = (
+            -4.0 * arr[1:-1, 1:-1]
+            + arr[:-2, 1:-1]
+            + arr[2:, 1:-1]
+            + arr[1:-1, :-2]
+            + arr[1:-1, 2:]
         )
-        arr = np.array(laplacian, dtype=np.float64) - 128.0
-        variance = float(np.var(arr))
+        if lap.size == 0:
+            return 0.0
+        variance = float(np.var(lap))
         return min(variance / _SHARPNESS_MAX, 1.0)
     except Exception:
         return 0.0
+
+
+def _normalize_score(raw: object) -> float:
+    """Clamp an analysis score into [0, 1] for compositing.
+
+    The composite ``0.5*sharpness + 0.5*score`` assumes ``score`` is in
+    [0, 1], but an LLM can answer on a 0-10 or 0-100 scale, or return a
+    non-numeric/None value — any of which skews or breaks the composite
+    (ND-19). ``analyze.score`` already clamps its own output, but
+    ``select.best`` can run on assets scored elsewhere, so clamp
+    defensively here too.
+    """
+    try:
+        value = float(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0.0
+    if value != value:  # NaN
+        return 0.0
+    if value < 0.0:
+        return 0.0
+    if value > 1.0:
+        return 1.0
+    return value
 
 
 def _get_file_size(asset: Asset) -> int:
@@ -126,7 +162,7 @@ class SelectBest(Stage):
         scored: list[tuple[Asset, float, int]] = []
 
         for asset in ctx.assets:
-            analysis_score = asset.metadata.get("score", 0.0)
+            analysis_score = _normalize_score(asset.metadata.get("score", 0.0))
             sharpness = 0.0
 
             # Try to compute sharpness from thumbnail

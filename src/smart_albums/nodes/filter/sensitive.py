@@ -20,7 +20,7 @@ class FilterSensitive(Stage):
         ConfigParam("blocklist_ids", list[str], default=None),
         ConfigParam("blocked_tags", list[str], default=None),
         ConfigParam("negative_queries", list[str], default=None),
-        ConfigParam("negative_query_limit", int, default=500),
+        ConfigParam("negative_query_limit", int, default=500, min=1),
         ConfigParam(
             "vision_threshold",
             float,
@@ -63,20 +63,36 @@ class FilterSensitive(Stage):
             signals = list(excluded_ids.get(asset.id, []))
             if asset.id in blocklist:
                 signals.append("manual_blocklist")
-            # Tags are stored under metadata["smart_info"]["tags"] by ImmichClient
-            asset_tags: list[str] = (
-                asset.metadata.get("smart_info", {}).get("tags", [])
-            )
+            # Tags are stored under metadata["smart_info"]["tags"] by
+            # ImmichClient. Guard against smart_info/tags being explicitly
+            # set to None (rather than simply absent), which would
+            # otherwise raise AttributeError/TypeError and abort the whole
+            # filter for every remaining asset.
+            smart_info = asset.metadata.get("smart_info") or {}
+            asset_tags: list[str] = smart_info.get("tags") or []
             if blocked_tags & set(asset_tags):
                 signals.append("blocked_tag")
             flags = asset.metadata.get("vision_flags")
-            if flags is None or asset.metadata.get("error"):
-                # Only apply fail_closed when vision analysis was attempted but
-                # produced an error — not when flags simply haven't been computed
-                if fail_closed and asset.metadata.get("error"):
-                    signals.append("fail_closed")
-            elif any(v >= threshold for v in flags.values()):
+            # Check the vision flags independently of any error condition.
+            # Previously this was an if/elif: `asset.metadata.get("error")`
+            # (a generic key that ANY earlier stage — embedding, score,
+            # etc. — can set for unrelated reasons) short-circuited the
+            # flag check entirely. That meant:
+            #   - with fail_closed=False: an asset with genuinely dangerous
+            #     vision_flags was still let through, as long as some
+            #     unrelated stage also failed on it.
+            #   - with fail_closed=True: any unrelated error (e.g. a
+            #     transient embedding fetch failure) excluded an otherwise
+            #     clean asset as "fail_closed", even though vision analysis
+            #     for this filter was never attempted or was fine.
+            # `vision_error` below is a dedicated key a vision-analysis
+            # stage can set to say "we tried to compute vision_flags for
+            # this asset and failed" — distinct from the generic `error`
+            # key other stages use for their own purposes.
+            if flags and any(v is not None and v >= threshold for v in flags.values()):
                 signals.append("vision_flag")
+            if flags is None and fail_closed and asset.metadata.get("vision_error"):
+                signals.append("fail_closed")
 
             if signals:
                 for s in signals:

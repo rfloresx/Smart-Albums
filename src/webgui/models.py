@@ -49,6 +49,13 @@ class ScheduleRecord(BaseModel):
     name: str
     pipeline: str
     pipeline_settings: dict[str, Any] = Field(default_factory=dict)
+    # Template variable definitions (e.g. {"YEAR": "2025"}) copied from the
+    # preset this schedule was configured from, if any. Resolved into
+    # pipeline_settings at fire/run-now time — see
+    # services/scheduler.py's _check_and_fire and pages/schedules.py's
+    # do_run_now, both of which previously sent {VAR} placeholders to the
+    # CLI unresolved (WG-19).
+    template_variables: dict[str, str] = Field(default_factory=dict)
     cron_expression: str
     enabled: bool = True
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))

@@ -8,7 +8,7 @@ from typing import Any, ClassVar, TYPE_CHECKING
 from smart_albums.core.context import PipelineContext, ContextBatch
 
 if TYPE_CHECKING:
-    from smart_albums.core.spec import Pipeline
+    pass
 
 
 @dataclass(frozen=True)

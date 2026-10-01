@@ -24,6 +24,12 @@ from tenacity import (
 from protocols_system import ProtocolsRegistry
 from protocols_system.protocols import ILLMClient, IHealthCheck
 
+from smart_albums.clients._llm_support import (
+    ImageConversionError as _ImageConversionError,
+    prepare_image_for_vision as _prepare_image_for_vision,
+    validate_against_schema as _validate_against_schema,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -34,37 +40,6 @@ _retry_policy = retry(
     before_sleep=before_sleep_log(logger, logging.WARNING),
     reraise=True,
 )
-
-
-def _validate_against_schema(data: dict[str, Any], schema: dict[str, Any]) -> str | None:
-    """Validate a dict against a simplified JSON schema.
-
-    Returns None if valid, or an error message string if validation fails.
-    Supports checking required keys and basic type constraints from the
-    schema's "properties" and "required" fields.
-    """
-    required_keys = schema.get("required", [])
-    properties = schema.get("properties", {})
-
-    for key in required_keys:
-        if key not in data:
-            return f"Missing required key: '{key}'"
-
-    for key, prop_schema in properties.items():
-        if key not in data:
-            continue
-        expected_type = prop_schema.get("type")
-        value = data[key]
-        if expected_type == "number" and not isinstance(value, (int, float)):
-            return f"Key '{key}' expected number, got {type(value).__name__}"
-        if expected_type == "string" and not isinstance(value, str):
-            return f"Key '{key}' expected string, got {type(value).__name__}"
-        if expected_type == "boolean" and not isinstance(value, bool):
-            return f"Key '{key}' expected boolean, got {type(value).__name__}"
-        if expected_type == "array" and not isinstance(value, list):
-            return f"Key '{key}' expected array, got {type(value).__name__}"
-
-    return None
 
 
 @ProtocolsRegistry.register("llamacpp", ILLMClient)
@@ -190,29 +165,16 @@ class LlamaCppClient:
         Raises:
             ConnectionError: On transient connection errors (retried by tenacity).
         """
-        # Detect image MIME type from magic bytes
-        if image_bytes[:4] == b'\x89PNG':
-            mime_type = "image/png"
-        elif image_bytes[:4] == b'RIFF' and image_bytes[8:12] == b'WEBP':
-            mime_type = "image/webp"
-        elif image_bytes[:2] == b'\xff\xd8':
-            mime_type = "image/jpeg"
-        else:
-            mime_type = "image/jpeg"  # fallback
-
-        # Convert WebP/unsupported formats to JPEG for compatibility
-        if mime_type not in ("image/jpeg", "image/png"):
-            try:
-                import io
-                from PIL import Image
-                img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-                buf = io.BytesIO()
-                img.save(buf, format="JPEG", quality=90)
-                image_bytes = buf.getvalue()
-                mime_type = "image/jpeg"
-                logger.debug("Converted image to JPEG (%d bytes)", len(image_bytes))
-            except Exception as exc:
-                logger.warning("Failed to convert image to JPEG: %s", exc)
+        # Normalize to a format the vision endpoint accepts. Unlike the old
+        # inline code — which only converted WebP, mislabeled everything
+        # else as image/jpeg while sending the original bytes, and on a
+        # conversion failure still sent the bad bytes — this converts every
+        # non-JPEG/PNG format (HEIC/TIFF/BMP/GIF/WebP), downscales large
+        # images, and fails cleanly if conversion isn't possible (CL-08).
+        try:
+            image_bytes, mime_type = _prepare_image_for_vision(image_bytes)
+        except _ImageConversionError as exc:
+            return {"error": f"Image conversion failed: {exc}"}
 
         image_b64 = base64.b64encode(image_bytes).decode("ascii")
 
@@ -255,14 +217,40 @@ class LlamaCppClient:
                     f"{exc.response.text}"
                 ) from exc
             return {"error": f"llama.cpp API error (HTTP {exc.response.status_code}): {exc.response.text}"}
+        except httpx.ConnectTimeout as exc:
+            # Couldn't even establish the connection — safe and worthwhile
+            # to retry.
+            raise ConnectionError(
+                f"Timeout connecting to llama.cpp server at {self._base_url}: {exc}"
+            ) from exc
+        except (httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout) as exc:
+            # A read timeout means the request *was* sent and the server is
+            # (still) processing it — retrying would pile a second
+            # expensive inference on top of the first while the abandoned
+            # one keeps running (CL-09). Return a per-image error instead of
+            # raising ConnectionError (which tenacity would retry 3x).
+            return {
+                "error": (
+                    f"llama.cpp request timed out after {self._timeout}s "
+                    f"(server may still be processing): {exc}"
+                )
+            }
         except httpx.ConnectError as exc:
             raise ConnectionError(
                 f"Cannot reach llama.cpp server at {self._base_url}: {exc}"
             ) from exc
-        except httpx.TimeoutException as exc:
+        except (httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError) as exc:
+            # Transport-level errors (connection reset mid-stream, protocol
+            # violation) previously escaped unhandled and bubbled all the
+            # way out of the stage (CL-09). Treat them as transient and
+            # retryable.
             raise ConnectionError(
-                f"Timeout connecting to llama.cpp server at {self._base_url}: {exc}"
+                f"Transport error talking to llama.cpp server at {self._base_url}: {exc}"
             ) from exc
+        except httpx.TimeoutException as exc:
+            # Any other timeout type — be conservative and don't retry a
+            # possibly-still-running inference.
+            return {"error": f"llama.cpp request timed out: {exc}"}
 
         try:
             data = response.json()
@@ -306,7 +294,16 @@ class LlamaCppClient:
         """Generate an embedding vector for an image.
 
         Sends the image as base64 to the llama.cpp server's ``/v1/embeddings``
-        endpoint. The server must be running with ``--embedding`` enabled.
+        endpoint. The server must be running with ``--embedding`` enabled
+        **and** loaded with a multimodal embedding model.
+
+        .. warning::
+            ``/v1/embeddings`` on a text-only embedding model will embed the
+            request payload as text rather than the image's visual content,
+            silently producing a vector unrelated to the picture (CL-09).
+            Only use this against a server you know is serving a multimodal
+            embedding model; otherwise prefer a dedicated image-embedding
+            provider (``huggingface``, ``image_embedding``).
 
         Args:
             image_bytes: Raw image bytes (JPEG, PNG, etc.).
@@ -351,6 +348,11 @@ class LlamaCppClient:
         except httpx.ConnectError as exc:
             raise ConnectionError(
                 f"Cannot reach llama.cpp server at {self._base_url}: {exc}"
+            ) from exc
+        except (httpx.ReadError, httpx.WriteError, httpx.RemoteProtocolError) as exc:
+            # Transport-level errors previously escaped unhandled (CL-09).
+            raise ConnectionError(
+                f"Transport error talking to llama.cpp server at {self._base_url}: {exc}"
             ) from exc
         except httpx.TimeoutException as exc:
             raise ConnectionError(

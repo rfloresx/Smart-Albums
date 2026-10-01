@@ -32,7 +32,10 @@ class PartitionCosine(Stage):
             key="threshold",
             type=float,
             default=0.85,
-            description="Minimum cosine similarity to group assets as scene members.",
+            min=-1.0,
+            max=1.0,
+            description="Minimum cosine similarity to group assets as scene members. "
+            "Cosine similarity is defined on [-1.0, 1.0] (ND-15).",
         ),
     )
 
@@ -45,13 +48,16 @@ class PartitionCosine(Stage):
         with_emb = [a for a in ctx.assets if a.metadata.get("embedding")]
         without_emb = [a for a in ctx.assets if not a.metadata.get("embedding")]
 
-        if len(with_emb) < 2:
-            return [ctx]
-
-        # Cluster using FAISS + Union-Find
-        groups = group_by_embedding_similarity(with_emb, threshold)
-
-        all_partitions: list[list[Any]] = list(groups.values())
+        # Only cluster when there are at least 2 embedded assets to compare.
+        # With fewer than 2, fall back to singleton partitions rather than
+        # returning the whole (unsplit) context — see partition/faiss.py
+        # for the failure mode this avoids.
+        if len(with_emb) >= 2:
+            groups = group_by_embedding_similarity(with_emb, threshold)
+            all_partitions: list[list[Any]] = list(groups.values())
+        else:
+            groups = {}
+            all_partitions = [[a] for a in with_emb]
 
         # Add assets without embeddings as individual partitions
         for asset in without_emb:

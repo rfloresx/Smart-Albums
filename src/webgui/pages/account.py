@@ -12,9 +12,10 @@ import logging
 from nicegui import ui
 
 from webgui.auth import (
+    SESSION_VERSION_KEY,
     get_current_username,
-    hash_password,
-    verify_password,
+    hash_password_async,
+    verify_password_async,
 )
 from webgui.components.navbar import build_navbar
 from webgui.state import state
@@ -68,61 +69,72 @@ async def account_page() -> None:
         success_label.set_visibility(False)
 
         async def change_password() -> None:
-            error_label.set_visibility(False)
-            success_label.set_visibility(False)
-
-            current = current_pw.value or ""
-            new = new_pw.value or ""
-            confirm = confirm_pw.value or ""
-
-            if not current:
-                error_label.text = "Current password is required."
-                error_label.set_visibility(True)
+            # Guard against double-submit — otherwise a double-click could
+            # race two update_user_password calls, each bumping the session
+            # version and invalidating the other's "stay logged in" session
+            # (WG-23).
+            if change_pw_btn.props.get("disable"):
                 return
+            change_pw_btn.props("disable loading")
+            try:
+                error_label.set_visibility(False)
+                success_label.set_visibility(False)
 
-            if len(new) < 8:
-                error_label.text = "New password must be at least 8 characters."
-                error_label.set_visibility(True)
-                return
+                current = current_pw.value or ""
+                new = new_pw.value or ""
+                confirm = confirm_pw.value or ""
 
-            if new != confirm:
-                error_label.text = "New passwords do not match."
-                error_label.set_visibility(True)
-                return
+                if not current:
+                    error_label.text = "Current password is required."
+                    error_label.set_visibility(True)
+                    return
 
-            # Verify current password
-            user = await state.db.get_user(username)
-            if user is None:
-                error_label.text = "User not found."
-                error_label.set_visibility(True)
-                return
+                if len(new) < 8:
+                    error_label.text = "New password must be at least 8 characters."
+                    error_label.set_visibility(True)
+                    return
 
-            if not verify_password(current, user["password_hash"]):
-                error_label.text = "Current password is incorrect."
-                error_label.set_visibility(True)
-                return
+                if new != confirm:
+                    error_label.text = "New passwords do not match."
+                    error_label.set_visibility(True)
+                    return
 
-            # Update password
-            new_hash = hash_password(new)
-            await state.db.update_user_password(username, new_hash)
+                # Verify current password
+                user = await state.db.get_user(username)
+                if user is None:
+                    error_label.text = "User not found."
+                    error_label.set_visibility(True)
+                    return
 
-            # Bump session version to invalidate all other active sessions.
-            # The AuthMiddleware/is_authenticated check will reject sessions
-            # that have a stale version, forcing re-login.
-            import uuid as _uuid
-            new_version = str(_uuid.uuid4())[:8]
-            await state.db.set_setting("session_version", new_version)
-            # Update current session so *this* user stays logged in
-            from nicegui import app as _app
-            _app.storage.user["session_version"] = new_version
+                if not await verify_password_async(current, user["password_hash"]):
+                    error_label.text = "Current password is incorrect."
+                    error_label.set_visibility(True)
+                    return
 
-            logger.info("Password changed for user: %s", username)
-            current_pw.value = ""
-            new_pw.value = ""
-            confirm_pw.value = ""
-            success_label.text = "Password changed successfully. Other sessions have been invalidated."
-            success_label.set_visibility(True)
+                # Update password
+                new_hash = await hash_password_async(new)
+                await state.db.update_user_password(username, new_hash)
 
-        ui.button(
+                # Bump session version to invalidate all other active sessions.
+                # The AuthMiddleware/is_authenticated check will reject sessions
+                # that have a stale version, forcing re-login. New logins pick up
+                # the new version automatically via set_authenticated().
+                import uuid as _uuid
+                new_version = str(_uuid.uuid4())[:8]
+                await state.db.set_setting(SESSION_VERSION_KEY, new_version)
+                # Update current session so *this* user stays logged in
+                from nicegui import app as _app
+                _app.storage.user["session_version"] = new_version
+
+                logger.info("Password changed for user: %s", username)
+                current_pw.value = ""
+                new_pw.value = ""
+                confirm_pw.value = ""
+                success_label.text = "Password changed successfully. Other sessions have been invalidated."
+                success_label.set_visibility(True)
+            finally:
+                change_pw_btn.props(remove="disable loading")
+
+        change_pw_btn = ui.button(
             "Change Password", icon="lock", on_click=change_password
         ).props("color=primary")

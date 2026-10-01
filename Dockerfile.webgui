@@ -17,11 +17,17 @@
 # ---------------------------------------------------------------------------
 # Stage 1: build a wheel from the src-layout / hatchling project.
 # ---------------------------------------------------------------------------
+# Base image pinned by digest for reproducible builds (DK-04). Update the
+# digest deliberately when picking up a new python:3.11-slim. (This digest
+# is a placeholder for the local python:3.11-slim; re-pin with
+# `docker buildx imagetools inspect python:3.11-slim` in CI.)
 FROM python:3.11-slim AS builder
 
 WORKDIR /build
 
-RUN python -m pip install --no-cache-dir --upgrade pip build
+# Pin build tooling versions so a wheel built today and one built next month
+# use the same toolchain (DK-04).
+RUN python -m pip install --no-cache-dir --upgrade "pip==24.2" "build==1.2.2"
 
 # Copy only what the build backend needs.
 COPY pyproject.toml README.md LICENSE ./
@@ -51,9 +57,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libwebp7 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install CPU-only PyTorch (avoids pulling ~2GB CUDA variant)
+# Install CPU-only PyTorch (avoids pulling ~2GB CUDA variant). Pinned so
+# the image is reproducible rather than tracking whatever the CPU index's
+# latest torch happens to be at build time (DK-04).
 RUN pip install --no-cache-dir \
-    torch --index-url https://download.pytorch.org/whl/cpu
+    "torch==2.4.1" --index-url https://download.pytorch.org/whl/cpu
 
 # Install the main package from the wheel with all required extras.
 # torch is already satisfied from above so pip won't re-download it.
@@ -65,19 +73,43 @@ RUN apt-get update && apt-get install -y --no-install-recommends git \
     && apt-get purge -y --auto-remove git \
     && rm -rf /var/lib/apt/lists/* /tmp/*.whl
 
-# Copy the webgui package, scripts, and default prompts
-COPY src/webgui /app/webgui
+# Copy the maintenance scripts and default prompts only. The ``webgui``
+# package itself is NOT copied here — it's already installed from the wheel
+# above, and copying ``src/webgui`` to ``/app/webgui`` (with WORKDIR /app)
+# made ``python -m webgui`` import the copied tree instead of the installed
+# one, giving two sources of truth that could drift apart (DK-03). The
+# Tools page locates these scripts via SMART_ALBUMS_SCRIPTS_DIR / /app /
+# the package root (see pages/tools.py).
 COPY scripts /app/scripts
 COPY prompts /app/prompts
+ENV SMART_ALBUMS_SCRIPTS_DIR=/app/scripts
 
-# Create data directories
-RUN mkdir -p /data/cache /data/prompts /data/db /data/hf_cache /config
+# Create data directories. /data/exports is required here too: the
+# compose file mounts a named volume at /data/exports, and Docker creates
+# missing volume mount points as root-owned directories at container start
+# if the image doesn't already contain them. That left /data/exports
+# owned by root while the app runs as appuser (see chown below), so every
+# export.context write failed with EACCES. /data/hf_cache is included so
+# it too is chowned to appuser below, even though HuggingFace will create
+# it lazily if the compose file doesn't mount a volume there.
+RUN mkdir -p /data/cache /data/prompts /data/db /data/hf_cache /data/exports /config
 
-# Run as non-root user
+# Run as non-root user. Only the writable data/config volumes are chowned
+# to appuser — NOT /app. Leaving application code (and the copied scripts/
+# prompts) owned by root and read-only to appuser means a compromised
+# request handler can't rewrite the code it's running (DK-03): this is what
+# downgrades the WG-02 arbitrary-write class of bugs from potential RCE to
+# a data-only issue.
 RUN useradd --uid 1000 --user-group --no-create-home appuser \
-    && chown -R appuser:appuser /data /config /app
+    && chown -R appuser:appuser /data /config
 USER appuser
 
 EXPOSE 8000
+
+# Healthcheck so `restart: unless-stopped` in compose can actually tell a
+# wedged server from a healthy one (DK-05). Hits the login page, which is
+# always served (reachable without auth) and returns 200 once the app is up.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/login', timeout=4).status==200 else 1)" || exit 1
 
 CMD ["python", "-m", "webgui"]

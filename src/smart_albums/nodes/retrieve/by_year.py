@@ -22,7 +22,10 @@ class RetrieveByYear(Stage):
     async def run(self, ctx: PipelineContext) -> ContextBatch:
         year = self.get("year")
         after = datetime(year, 1, 1, 0, 0, 0)
-        before = datetime(year, 12, 31, 23, 59, 59)
+        # Exclusive upper bound (midnight Jan 1 of the next year) instead of
+        # Dec 31 23:59:59, which dropped assets captured in the final second
+        # of the year with sub-second precision (ND-14).
+        before = datetime(year + 1, 1, 1, 0, 0, 0)
 
         progress = ProtocolsRegistry.get_instance(IProgressReporter)
         image_client = ProtocolsRegistry.get_instance(IImageClient)
