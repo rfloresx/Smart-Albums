@@ -76,12 +76,16 @@ RUN pip install --no-cache-dir \
     "torch==2.4.1" --index-url https://download.pytorch.org/whl/cpu
 
 # Install the built wheel with every extra both entrypoints may use. torch is
-# already satisfied above so pip won't re-download it. No git is needed:
-# protocols-system is now a published versioned wheel, not a git dependency
-# (SIMPLIFICATION 4.2), so the whole package resolves from the index.
+# already satisfied above so pip won't re-download it. git is needed to
+# resolve the protocols-system dependency, which is pinned to the v0.2.0 git
+# tag in pyproject.toml; it is purged in the same layer to keep the image
+# small. Drop it once protocols-system is on a package index (SIMPLIFICATION
+# 4.2).
 COPY --from=builder /build/dist/*.whl /tmp/
-RUN pip install --no-cache-dir "$(ls /tmp/*.whl)[geo,huggingface,openai,webgui,heif]" \
-    && rm -rf /tmp/*.whl
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && pip install --no-cache-dir "$(ls /tmp/*.whl)[geo,huggingface,openai,webgui,heif]" \
+    && apt-get purge -y --auto-remove git \
+    && rm -rf /var/lib/apt/lists/* /tmp/*.whl
 
 # Copy the maintenance scripts and default prompts only. The installed
 # package (from the wheel) is the single source of truth for code; copying

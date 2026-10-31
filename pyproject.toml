@@ -35,11 +35,12 @@ dependencies = [
     # Provider implementations (immich/ollama/llamacpp/image_embedding/
     # google_places/local) now live in the shared protocols-system package;
     # the [providers] extra pulls httpx, immichpy, tenacity, and ollama. The
-    # [openai] extra adds the OpenAI LLM provider. Pinned to an exact version
-    # rather than a git SHA so every build (CI + Docker images) resolves the
-    # same published artifact without needing git in the image, and so both
-    # consumers stay in lockstep on one version (CO-03 / SIMPLIFICATION 2.2).
-    "protocols-system[providers,openai]==0.2.0",
+    # [openai] extra adds the OpenAI LLM provider. Pinned to the immutable
+    # v0.2.0 git tag so every build (CI + Docker image) resolves the same ref
+    # and both consumers stay in lockstep on one version (CO-03 /
+    # SIMPLIFICATION 2.2). Switch to `protocols-system[...]==0.2.x` once the
+    # package is on a package index.
+    "protocols-system[providers,openai] @ git+https://github.com/rfloresx/ProtocolsSystem.git@v0.2.0",
 ]
 
 [project.optional-dependencies]
@@ -47,12 +48,12 @@ dependencies = [
 # "pillow-heif not installed" error now live in protocols-system's shared
 # llm_support module, so pull its [heif] extra.
 heif = [
-    "protocols-system[heif]==0.2.0",
+    "protocols-system[heif] @ git+https://github.com/rfloresx/ProtocolsSystem.git@v0.2.0",
 ]
 # Local CLIP-family image embeddings — the HuggingFace provider moved into
 # protocols-system; pull its [huggingface] extra (transformers + torch).
 huggingface = [
-    "protocols-system[huggingface]==0.2.0",
+    "protocols-system[huggingface] @ git+https://github.com/rfloresx/ProtocolsSystem.git@v0.2.0",
 ]
 # Google Places reverse geocoding provider moved into protocols-system; the
 # base [providers] extra does not include googlemaps, so expose it here.
@@ -62,7 +63,7 @@ geo = [
 # OpenAI LLM provider is pulled by the base dependency's [openai] extra, but
 # keep this group so `pip install .[openai]` still resolves.
 openai = [
-    "protocols-system[openai]==0.2.0",
+    "protocols-system[openai] @ git+https://github.com/rfloresx/ProtocolsSystem.git@v0.2.0",
 ]
 dev = [
     "pytest>=8.2.0,<9",
@@ -75,7 +76,7 @@ webgui = [
     "aiosqlite>=0.20.0,<1",
     # bcrypt is pulled via protocols-system's [webauth] extra, which owns the
     # shared password-hashing primitives used by webgui.auth.
-    "protocols-system[webauth]==0.2.0",
+    "protocols-system[webauth] @ git+https://github.com/rfloresx/ProtocolsSystem.git@v0.2.0",
 ]
 
 [project.scripts]
