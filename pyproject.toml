@@ -25,10 +25,6 @@ classifiers = [
 dependencies = [
     "typer>=0.12.0,<1",
     "click>=8.0,<9",
-    "immichpy>=7.0.0,<8",
-    "httpx>=0.27.0,<1",
-    "ollama>=0.4.0,<1",
-    "tenacity>=8.3.0,<10",
     "rich>=13.7.0,<14",
     "imagehash>=4.3.1,<5",
     "Pillow>=10.3.0,<14",
@@ -36,34 +32,37 @@ dependencies = [
     "PyYAML>=6.0,<7",
     "faiss-cpu>=1.7.4,<2",
     "numpy>=1.24.0,<3",
-    # Pinned to a specific commit rather than the default branch (CO-03):
-    # an unpinned git dependency means every build -- including CI and both
-    # Docker images -- re-resolves to whatever the upstream default branch
-    # currently points at. This project relies on ProtocolsRegistry's exact
-    # API (create/get_instance/set_instance/clear_instances), so an
-    # upstream change can silently break builds with no local diff to
-    # explain why. Bump this hash deliberately when picking up upstream
-    # changes.
-    "protocols-system @ git+https://github.com/rfloresx/ProtocolsSystem.git@77eb984c935593add1ccd91a126d7d8becaacb5b",
+    # Provider implementations (immich/ollama/llamacpp/image_embedding/
+    # google_places/local) now live in the shared protocols-system package;
+    # the [providers] extra pulls httpx, immichpy, tenacity, and ollama. The
+    # [openai] extra adds the OpenAI LLM provider. Pinned to an exact version
+    # rather than a git SHA so every build (CI + Docker images) resolves the
+    # same published artifact without needing git in the image, and so both
+    # consumers stay in lockstep on one version (CO-03 / SIMPLIFICATION 2.2).
+    "protocols-system[providers,openai]==0.2.0",
 ]
 
 [project.optional-dependencies]
-# HEIC/HEIF decoding support (iPhone photos). Optional because the pure
-# Python/Pillow install can't decode HEIC without it; when absent, the LLM
-# clients report a clear "pillow-heif not installed" error for HEIC input
-# instead of silently sending undecodable bytes (CL-08).
+# HEIC/HEIF decoding support (iPhone photos). The decode/convert path and the
+# "pillow-heif not installed" error now live in protocols-system's shared
+# llm_support module, so pull its [heif] extra.
 heif = [
-    "pillow-heif>=0.16.0,<1",
+    "protocols-system[heif]==0.2.0",
 ]
+# Local CLIP-family image embeddings — the HuggingFace provider moved into
+# protocols-system; pull its [huggingface] extra (transformers + torch).
 huggingface = [
-    "transformers>=4.38.0,<5",
-    "torch>=2.0.0",
+    "protocols-system[huggingface]==0.2.0",
 ]
+# Google Places reverse geocoding provider moved into protocols-system; the
+# base [providers] extra does not include googlemaps, so expose it here.
 geo = [
     "googlemaps>=4.10.0,<5",
 ]
+# OpenAI LLM provider is pulled by the base dependency's [openai] extra, but
+# keep this group so `pip install .[openai]` still resolves.
 openai = [
-    "openai>=1.0.0,<3",
+    "protocols-system[openai]==0.2.0",
 ]
 dev = [
     "pytest>=8.2.0,<9",
@@ -74,7 +73,9 @@ dev = [
 webgui = [
     "nicegui>=2.0,<3",
     "aiosqlite>=0.20.0,<1",
-    "bcrypt>=4.0,<5",
+    # bcrypt is pulled via protocols-system's [webauth] extra, which owns the
+    # shared password-hashing primitives used by webgui.auth.
+    "protocols-system[webauth]==0.2.0",
 ]
 
 [project.scripts]
@@ -122,14 +123,6 @@ module = [
     "webgui.services.*",
 ]
 disable_error_code = ["no-untyped-def", "no-untyped-call", "no-any-return", "assignment", "union-attr", "type-arg", "index", "call-overload", "arg-type", "comparison-overlap"]
-
-[[tool.mypy.overrides]]
-module = "smart_albums.clients.huggingface_embedding"
-disable_error_code = ["no-untyped-call", "union-attr", "operator", "attr-defined", "unused-ignore"]
-
-[[tool.mypy.overrides]]
-module = "smart_albums.clients.immich"
-disable_error_code = ["call-arg", "arg-type", "attr-defined"]
 
 [tool.ruff]
 # Linting was previously not configured at all and not run in CI, so a

@@ -14,8 +14,10 @@ This service bridges the webgui admin panel with the ``smart_albums``
   ``settings`` table in the app database, so changes take effect without
   editing ``config.yaml``.
 
-The parameter introspection reuses ``smart_albums.core.builder.get_init_schema``
-so the webgui and CLI stay in lock-step about what each provider accepts.
+The parameter introspection reuses the shared
+``protocols_system.core.discovery`` layer (``get_provider_schema`` +
+``ConfigParam``) so every app renders the same settings form from the same
+introspection logic.
 """
 
 from __future__ import annotations
@@ -26,9 +28,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from smart_albums.cli.imports import import_clients
-from smart_albums.core.builder import get_init_schema
-from smart_albums.core.node import ConfigParam
 from protocols_system import ProtocolsRegistry
+from protocols_system.core.types import ConfigParam
+from protocols_system.core.discovery import get_provider_schema
 from protocols_system.protocols import (
     ICache,
     IHealthCheck,
@@ -219,50 +221,16 @@ class ProviderSpec:
     supports_health_check: bool
 
 
-_SECRET_HINTS = ("api_key", "apikey", "password", "secret", "token")
-
-
-def _classify_param(param: ConfigParam) -> str:
-    """Map a ConfigParam to a UI widget kind.
-
-    Because provider modules use ``from __future__ import annotations``, the
-    ``type`` attribute is typically the annotation *string* (e.g. ``"str"``).
-    We combine the annotation text with the default value's runtime type to
-    pick the most appropriate widget.
-    """
-    annotation = param.type
-    type_name = (
-        annotation
-        if isinstance(annotation, str)
-        else getattr(annotation, "__name__", str(annotation))
-    ).lower()
-
-    default = param.default
-    key = param.key.lower()
-
-    # bool must be checked before int (bool is a subclass of int).
-    if "bool" in type_name or isinstance(default, bool):
-        return "bool"
-
-    if any(hint in key for hint in _SECRET_HINTS):
-        return "password"
-
-    if "float" in type_name or isinstance(default, float):
-        return "float"
-
-    if "int" in type_name or (
-        isinstance(default, int) and not isinstance(default, bool)
-    ):
-        return "int"
-
-    return "str"
-
-
 def _param_spec_from_config(param: ConfigParam) -> ParamSpec:
-    """Convert a core ConfigParam into a webgui ParamSpec."""
+    """Convert a shared discovery ConfigParam into a webgui ParamSpec.
+
+    The widget classification (str/password/int/float/bool) is already done by
+    the shared discovery layer and carried on ``param.widget_kind``, so the
+    webgui no longer re-derives it.
+    """
     return ParamSpec(
         name=param.key,
-        kind=_classify_param(param),
+        kind=param.widget_kind,
         required=param.required,
         default=param.default,
     )
@@ -302,9 +270,10 @@ def get_providers_for(slot: ProtocolSlot) -> list[ProviderSpec]:
     hc_classes = _health_check_classes()
 
     specs: list[ProviderSpec] = []
-    for name, cls in sorted(ProtocolsRegistry.get_providers(slot.protocol).items()):
-        schema = get_init_schema(cls)
-        params = [_param_spec_from_config(cp) for cp in schema.values()]
+    for name in sorted(ProtocolsRegistry.get_providers(slot.protocol)):
+        schema = get_provider_schema(slot.protocol, name)
+        cls = ProtocolsRegistry.get_providers(slot.protocol)[name]
+        params = [_param_spec_from_config(cp) for cp in schema]
         specs.append(
             ProviderSpec(
                 name=name,

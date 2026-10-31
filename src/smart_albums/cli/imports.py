@@ -34,7 +34,18 @@ def import_all_stages() -> None:
 
 
 def import_clients() -> None:
-    """Import client modules to trigger ProtocolsRegistry registration."""
-    import smart_albums.clients  # noqa: F401
+    """Register provider implementations with the ProtocolsRegistry.
+
+    Provider clients now live in the shared ``protocols_system.providers``
+    package (previously duplicated under ``smart_albums.clients``). Calling
+    ``register_builtin_providers()`` imports every provider module so its
+    ``@ProtocolsRegistry.register`` decorators fire; providers whose optional
+    dependencies are missing are skipped silently.
+    """
+    from protocols_system.providers import register_builtin_providers
+
+    register_builtin_providers()
+
+    # smart_albums still owns the pipeline cache providers.
     import smart_albums.core.cache  # noqa: F401
     import smart_albums.core.no_cache  # noqa: F401

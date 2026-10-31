@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import contextlib
 import logging
-import os
 from typing import Any, Optional
 
 from rich.console import Console
@@ -41,8 +40,8 @@ def _default_provider_for(protocol_name: str, providers: dict[str, Any]) -> str:
     Previously this was always ``next(iter(providers.keys()))`` — whichever
     provider happened to be registered first, which depends on Python's
     dict insertion order, which in turn depends on module import order
-    (``smart_albums.clients`` imports ``core.cache`` before ``core.no_cache``,
-    see ``cli/imports.import_clients``). For ``cachemanager`` specifically,
+    (``cli/imports.import_clients`` registers the shared providers, then
+    ``core.cache`` before ``core.no_cache``). For ``cachemanager`` specifically,
     that meant caching was silently *on* by default, using
     ``CacheManager``'s own default directory — surprising for anyone who
     didn't explicitly configure a cache, and broken in the CLI Docker image
@@ -61,12 +60,17 @@ def _apply_env_var_defaults(
 ) -> None:
     """Fill in provider_kwargs from documented env vars, without overriding
     values already supplied via CLI flags or the config file."""
+    from smart_albums.utils.secrets import read_env_secret
+
     for env_name, (target_protocol, target_provider, param_name) in _ENV_VAR_PROVIDER_DEFAULTS.items():
         if target_protocol != protocol_name or target_provider != chosen:
             continue
         if param_name in provider_kwargs:
             continue
-        value = os.environ.get(env_name)
+        # read_env_secret prefers a Docker secret via `<env>_FILE` (so
+        # IMMICH_API_KEY_FILE works like it does for PhotoStudio) and falls
+        # back to the plain env var for the non-secret URL/model vars.
+        value = read_env_secret(env_name)
         if value:
             provider_kwargs[param_name] = value
 

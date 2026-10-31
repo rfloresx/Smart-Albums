@@ -181,10 +181,13 @@ app.add_middleware(AuthMiddleware)
 def _get_storage_secret() -> str:
     """Get or generate the storage secret for NiceGUI sessions.
 
-    Reads from STORAGE_SECRET env var. If not set, generates a random
-    secret (sessions won't persist across server restarts in that case).
+    Reads STORAGE_SECRET (or, preferred, a Docker secret via
+    STORAGE_SECRET_FILE). If neither is set, generates a random secret
+    (sessions won't persist across server restarts in that case).
     """
-    secret = os.environ.get("STORAGE_SECRET")
+    from smart_albums.utils.secrets import read_env_secret
+
+    secret = read_env_secret("STORAGE_SECRET")
     if secret:
         return secret
     logger.warning(

@@ -10,74 +10,45 @@ reading storage in a page handler.
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import secrets
 import time
 from typing import Optional
 
-import bcrypt
 from nicegui import app
 
+# The bcrypt password primitives (hash/verify, off-event-loop dispatch, and
+# the timing-safe unknown-username comparison) are shared across both web
+# apps and live in protocols_system.webauth. They are re-exported here so
+# existing callers keep importing them from webgui.auth; this module keeps
+# only the Smart-Albums-specific login rate limiting and NiceGUI session
+# helpers.
+from protocols_system.webauth import (
+    hash_password,
+    hash_password_async,
+    verify_password,
+    verify_password_async,
+)
+
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    "hash_password",
+    "hash_password_async",
+    "verify_password",
+    "verify_password_async",
+    "SESSION_VERSION_KEY",
+    "check_login_rate_limit",
+    "record_login_failure",
+    "clear_login_failures",
+    "is_authenticated",
+    "get_current_username",
+    "set_authenticated",
+    "clear_authentication",
+]
 
 # Settings-table key that holds the current global session version. Bumped
 # whenever a password changes so that other active sessions are logged out.
 SESSION_VERSION_KEY = "session_version"
-
-# A bcrypt hash of a random, never-used password, computed once at import
-# time. Used by verify_password_async() to burn roughly the same amount of
-# CPU time for an unknown username as for a known one with a wrong
-# password, so response timing doesn't reveal which usernames exist
-# (WG-10). Comparing against this hash always fails.
-_DUMMY_HASH = bcrypt.hashpw(secrets.token_bytes(32), bcrypt.gensalt()).decode("utf-8")
-
-
-# ---------------------------------------------------------------------------
-# Password hashing
-# ---------------------------------------------------------------------------
-
-
-def hash_password(password: str) -> str:
-    """Hash a password using bcrypt."""
-    return bcrypt.hashpw(
-        password.encode("utf-8"), bcrypt.gensalt()
-    ).decode("utf-8")
-
-
-def verify_password(password: str, hashed: str) -> bool:
-    """Verify a password against a bcrypt hash."""
-    return bcrypt.checkpw(
-        password.encode("utf-8"), hashed.encode("utf-8")
-    )
-
-
-async def hash_password_async(password: str) -> str:
-    """Hash a password off the event loop.
-
-    bcrypt's hashpw/checkpw are synchronous CPU-bound calls (roughly
-    100-300ms each). Calling them directly inside an async handler blocks
-    NiceGUI's single event loop for that long, freezing every other
-    connected client's UI and the background scheduler for the duration
-    (WG-10). Dispatch to a thread instead.
-    """
-    return await asyncio.to_thread(hash_password, password)
-
-
-async def verify_password_async(password: str, hashed: Optional[str]) -> bool:
-    """Verify a password off the event loop, without leaking via timing.
-
-    When ``hashed`` is ``None`` (unknown username), this still runs a
-    bcrypt comparison against a fixed dummy hash rather than returning
-    immediately. Skipping bcrypt entirely for unknown usernames (the
-    previous behavior: ``if user is None or not verify_password(...)``)
-    makes an unknown-username response measurably faster than a
-    known-username/wrong-password response, which lets an attacker
-    enumerate valid usernames by timing alone.
-    """
-    target = hashed if hashed is not None else _DUMMY_HASH
-    result = await asyncio.to_thread(verify_password, password, target)
-    return result if hashed is not None else False
 
 
 # ---------------------------------------------------------------------------

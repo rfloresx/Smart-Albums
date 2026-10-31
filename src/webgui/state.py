@@ -60,8 +60,12 @@ class AppState:
         if self.config.auth.enabled:
             count = await self.db.user_count()
             if count == 0:
+                from smart_albums.utils.secrets import read_env_secret
+
                 username = os.environ.get("ADMIN_USERNAME", "")
-                password = os.environ.get("ADMIN_PASSWORD", "")
+                # Prefer a Docker secret via ADMIN_PASSWORD_FILE over the
+                # plaintext ADMIN_PASSWORD env var.
+                password = read_env_secret("ADMIN_PASSWORD")
                 if username and password:
                     from webgui.auth import hash_password
 

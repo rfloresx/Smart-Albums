@@ -2,14 +2,18 @@ services:
   smart-albums:
     build:
       context: .
-      dockerfile: Dockerfile.webgui
+      # Single multi-purpose image (the webgui and one-shot rotation share
+      # one Dockerfile now; the rotation job is `docker run ... smart-albums
+      # rotation` against this same image).
+      dockerfile: Dockerfile
     container_name: smart-albums-gui
     restart: unless-stopped
     ports:
-      # Bound to localhost by default. Change to "8080:8000" (all
-      # interfaces) only once you have set ADMIN_USERNAME/ADMIN_PASSWORD
-      # below, or set ALLOW_OPEN_SETUP=1 to accept an open first-run.
-      - "127.0.0.1:8080:8000"
+      # Internal port standardized to 8080 across all workspace images
+      # (SIMPLIFICATION 4.2). Bound to localhost by default; expose beyond
+      # 127.0.0.1 only once ADMIN_USERNAME/ADMIN_PASSWORD are set below, or
+      # set ALLOW_OPEN_SETUP=1 to accept an open first-run.
+      - "127.0.0.1:8080:8080"
     volumes:
       - ./config.yaml:/config/config.yaml:ro
       - smart-albums-cache:/data/cache
@@ -27,10 +31,18 @@ services:
       # one with `openssl rand -base64 32` and set it in a .env file next to
       # this compose file, or export it in your shell. Leaving this empty
       # invalidates all sessions on every restart.
+      #
+      # Secrets convention: each of STORAGE_SECRET / ADMIN_PASSWORD /
+      # IMMICH_API_KEY also honors a `<NAME>_FILE` variant pointing at a file
+      # (e.g. a Docker secret at /run/secrets/...), which takes precedence
+      # over the plaintext env var — the plain var is visible in
+      # `docker inspect`, the file is not. Mount the secret and set
+      # STORAGE_SECRET_FILE=/run/secrets/storage_secret instead of the value.
       - STORAGE_SECRET=${STORAGE_SECRET:-}
       # Authentication: set admin credentials for first-time setup so the
       # admin account is created automatically instead of being claimed by
-      # whoever visits /setup first.
+      # whoever visits /setup first. Prefer ADMIN_PASSWORD_FILE for the
+      # password in production.
       - ADMIN_USERNAME=${ADMIN_USERNAME:-}
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
       # Only set this to 1 if you understand the risk: with no admin
