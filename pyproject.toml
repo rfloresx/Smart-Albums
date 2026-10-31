@@ -33,37 +33,38 @@ dependencies = [
     "faiss-cpu>=1.7.4,<2",
     "numpy>=1.24.0,<3",
     # Provider implementations (immich/ollama/llamacpp/image_embedding/
-    # google_places/local) now live in the shared protocols-system package;
-    # the [providers] extra pulls httpx, immichpy, tenacity, and ollama. The
-    # [openai] extra adds the OpenAI LLM provider. Pinned to the immutable
-    # v0.2.0 git tag so every build (CI + Docker image) resolves the same ref
-    # and both consumers stay in lockstep on one version (CO-03 /
-    # SIMPLIFICATION 2.2). Switch to `protocols-system[...]==0.2.x` once the
-    # package is on a package index.
-    "protocols-system[providers,openai] @ git+https://github.com/rfloresx/ProtocolsSystem.git@v0.2.0",
+    # google_places/local) now live in the shared rfx-protocols-system
+    # package; the [providers] extra pulls httpx, immichpy, tenacity, and
+    # ollama. The [openai] extra adds the OpenAI LLM provider. Pinned to the
+    # immutable v0.2.0 git tag so every build (CI + Docker image) resolves the
+    # same ref and both consumers stay in lockstep on one version (CO-03 /
+    # SIMPLIFICATION 2.2). Switch to `rfx-protocols-system[...]==0.2.x` once
+    # the package is on a package index. The importable package is still
+    # `protocols_system`; only the distribution name is namespaced.
+    "rfx-protocols-system[providers,openai] @ git+https://github.com/rfloresx/ProtocolsSystem.git@v0.2.0",
 ]
 
 [project.optional-dependencies]
 # HEIC/HEIF decoding support (iPhone photos). The decode/convert path and the
-# "pillow-heif not installed" error now live in protocols-system's shared
+# "pillow-heif not installed" error now live in rfx-protocols-system's shared
 # llm_support module, so pull its [heif] extra.
 heif = [
-    "protocols-system[heif] @ git+https://github.com/rfloresx/ProtocolsSystem.git@v0.2.0",
+    "rfx-protocols-system[heif] @ git+https://github.com/rfloresx/ProtocolsSystem.git@v0.2.0",
 ]
 # Local CLIP-family image embeddings — the HuggingFace provider moved into
-# protocols-system; pull its [huggingface] extra (transformers + torch).
+# rfx-protocols-system; pull its [huggingface] extra (transformers + torch).
 huggingface = [
-    "protocols-system[huggingface] @ git+https://github.com/rfloresx/ProtocolsSystem.git@v0.2.0",
+    "rfx-protocols-system[huggingface] @ git+https://github.com/rfloresx/ProtocolsSystem.git@v0.2.0",
 ]
-# Google Places reverse geocoding provider moved into protocols-system; the
-# base [providers] extra does not include googlemaps, so expose it here.
+# Google Places reverse geocoding provider moved into rfx-protocols-system;
+# the base [providers] extra does not include googlemaps, so expose it here.
 geo = [
     "googlemaps>=4.10.0,<5",
 ]
 # OpenAI LLM provider is pulled by the base dependency's [openai] extra, but
 # keep this group so `pip install .[openai]` still resolves.
 openai = [
-    "protocols-system[openai] @ git+https://github.com/rfloresx/ProtocolsSystem.git@v0.2.0",
+    "rfx-protocols-system[openai] @ git+https://github.com/rfloresx/ProtocolsSystem.git@v0.2.0",
 ]
 dev = [
     "pytest>=8.2.0,<9",
@@ -74,9 +75,9 @@ dev = [
 webgui = [
     "nicegui>=2.0,<3",
     "aiosqlite>=0.20.0,<1",
-    # bcrypt is pulled via protocols-system's [webauth] extra, which owns the
-    # shared password-hashing primitives used by webgui.auth.
-    "protocols-system[webauth] @ git+https://github.com/rfloresx/ProtocolsSystem.git@v0.2.0",
+    # bcrypt is pulled via rfx-protocols-system's [webauth] extra, which owns
+    # the shared password-hashing primitives used by webgui.auth.
+    "rfx-protocols-system[webauth] @ git+https://github.com/rfloresx/ProtocolsSystem.git@v0.2.0",
 ]
 
 [project.scripts]
@@ -146,7 +147,7 @@ select = [
 ignore = ["B008"]
 
 [tool.hatch.metadata]
-# Required to allow the git direct reference for protocols-system.
+# Required to allow the git direct reference for rfx-protocols-system.
 allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
